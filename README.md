@@ -1,6 +1,6 @@
 # Local Digest - MLX Local Models
 
-A simple, fast local digest app that uses AppleScript to extract emails and MLX local models (via mlx-lm) for AI summarization.
+A simple, fast local digest app that uses AppleScript to extract emails and local AI models (MLX or Apple Intelligence) for summarization.
 
 ![Local Digest Screenshot](screenshot.jpg)
 
