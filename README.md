@@ -105,12 +105,11 @@ macOS will ask for permission the first time the app accesses Mail, Calendar,
 Reminders, or Messages. Grant access to allow those tabs to load data.
 
 If Messages still shows empty, the app can fall back to reading
-`~/Library/Messages/chat.db` (requires Full Disk Access for the venv Python
-binary). You can control this with `MESSAGES_DB_FALLBACK=1`.
+`~/Library/Messages/chat.db`. You can control this with `MESSAGES_DB_FALLBACK=1`.
 
-If macOS won’t let you select the venv Python binary, you can add
-`MessagesPython.app` (in the project root) to Full Disk Access and launch
-the server by opening that app.
+**Recommended**: Instead of granting Full Disk Access to your terminal or Python binary, authorize only the app folder in System Settings → Privacy & Security → Full Disk Access. This is more secure than giving blanket access to your terminal.
+
+Alternatively, you can add `MessagesPython.app` (in the project root) to Full Disk Access and launch the server by opening that app.
 
 ## Troubleshooting
 
