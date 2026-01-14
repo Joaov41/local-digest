@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Database files (may contain personal data)
+*.db
+
+# Environment variables
+.env
+.env.local
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
