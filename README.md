@@ -4,6 +4,7 @@ A simple, fast local digest app that uses AppleScript to extract emails and MLX 
 
 ## Features
 
+- **Daily Overview**: One-click summary combining your emails, calendar, reminders, and messages into a single AI-generated digest of your day
 - Extract emails directly from Apple Mail using AppleScript
 - Summarize emails using local MLX models
 - View upcoming calendar events and summarize key details
@@ -89,6 +90,7 @@ export APPLE_FM_BRIDGE_PATH=/path/to/apple_foundation_bridge
 - `GET /api/messages` - Get recent message threads (default last 48 hours)
 - `POST /api/summarize` - Generate summary for an email
 - `POST /api/summarize-generic` - Summarize calendar/reminders/messages
+- `POST /api/overview` - Generate daily overview combining all sources
 - `GET /api/summaries` - Get all saved summaries
 - `DELETE /api/summaries/<id>` - Delete a summary
 - `POST /api/clear-all` - Clear all summaries
