@@ -112,9 +112,24 @@ the server by opening that app.
 - If summaries fail, check that mlx-lm is installed and the model can load
 - If model not found, set `MLX_MODEL` to a valid local or HF model ID
 
-## Downloading more MLX models
+## Using MLX Models
 
-Models are pulled from the Hugging Face Hub the first time you reference them.
+### Already Downloaded Models
+
+If you have MLX models already downloaded on your machine (e.g., from LM Studio or previous mlx-lm usage), you can use them directly by providing the local path:
+
+```bash
+export MLX_MODEL=/path/to/your/local/model
+export MLX_MODEL_LIST=/path/to/model1,/path/to/model2
+```
+
+Common locations for downloaded models:
+- LM Studio: `~/.cache/lm-studio/models/`
+- Hugging Face cache: `~/.cache/huggingface/hub/`
+
+### Downloading New Models
+
+Models can also be pulled from the Hugging Face Hub the first time you reference them.
 Pick a model ID and set it in `MLX_MODEL` (or add it to `MLX_MODEL_LIST`), then
 run the app and mlx-lm will download it automatically.
 
