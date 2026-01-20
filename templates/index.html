@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Digest</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📧 Local Digest</h1>
+            <div class="status-bar">
+                <span class="status-indicator" id="mlx-status">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Checking MLX...</span>
+                </span>
+                <select id="model-selector" class="model-selector">
+                    <option value="">Loading models...</option>
+                </select>
+                <div class="model-controls">
+                    <input id="model-input" class="model-input" type="text" placeholder="HF model id or local path..." />
+                    <button id="model-add" class="btn btn-secondary">Add Model</button>
+                </div>
+                <span id="model-add-status" class="model-add-status"></span>
+                <button id="generate-digest-btn" class="btn btn-digest">Generate Daily Digest</button>
+                <button id="refresh-btn" class="btn btn-primary">Refresh Emails</button>
+                <label class="auto-refresh-toggle">
+                    <input type="checkbox" id="auto-refresh-toggle">
+                    <span>Auto-refresh</span>
+                </label>
+                <label class="theme-toggle">
+                    <input type="checkbox" id="dark-mode-toggle">
+                    <span>Dark mode</span>
+                </label>
+                <button id="shutdown-btn" class="btn btn-secondary">Close App</button>
+                <span id="refresh-countdown" class="refresh-countdown"></span>
+            </div>
+        </header>
+
+        <div class="tabs">
+            <button class="tab active" data-tab="email">Email</button>
+            <button class="tab" data-tab="calendar">Calendar & Reminders</button>
+            <button class="tab" data-tab="messages">Messages</button>
+        </div>
+
+        <div class="tab-content active" id="tab-email">
+            <div class="main-content">
+                <!-- Email List Panel -->
+                <div class="panel email-list-panel">
+                    <div class="panel-header">
+                        <h2>Recent Emails</h2>
+                        <div class="email-controls">
+                            <select id="email-count">
+                                <option value="10">Last 10</option>
+                                <option value="25">Last 25</option>
+                                <option value="50">Last 50</option>
+                            </select>
+                            <select id="email-hours">
+                                <option value="24">24 hours</option>
+                                <option value="48">48 hours</option>
+                                <option value="72">72 hours</option>
+                                <option value="168">1 week</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="email-list" id="email-list">
+                        <div class="loading">Loading emails...</div>
+                    </div>
+                </div>
+
+                <!-- Summary Panel -->
+                <div class="panel summary-panel">
+                    <div class="panel-header">
+                        <h2>Email Summary</h2>
+                        <div class="panel-actions">
+                            <button id="export-email" class="btn btn-secondary" style="display: none;">Export</button>
+                            <button id="view-all-summaries" class="btn btn-secondary">View All Summaries</button>
+                        </div>
+                    </div>
+                    <div class="summary-content" id="summary-content">
+                        <div class="empty-state">
+                            <p>Select an email to view or generate its summary</p>
+                        </div>
+                    </div>
+                    <!-- Chat Interface -->
+                    <div class="chat-container" id="chat-container" style="display: none;">
+                        <div class="chat-messages" id="chat-messages"></div>
+                        <div class="chat-input-container">
+                            <input type="text" id="chat-input" class="chat-input" placeholder="Ask a question about this email..." />
+                            <button id="chat-send" class="btn btn-primary">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-calendar">
+            <div class="main-content">
+                <div class="panel-column">
+                    <div class="panel calendar-panel">
+                        <div class="panel-header">
+                            <h2>Upcoming Calendar</h2>
+                            <div class="panel-actions">
+                                <select id="calendar-days">
+                                    <option value="1">Next 24h</option>
+                                    <option value="3">Next 3 days</option>
+                                    <option value="7" selected>Next 7 days</option>
+                                    <option value="14">Next 2 weeks</option>
+                                </select>
+                                <button id="calendar-refresh" class="btn btn-secondary">Refresh</button>
+                            </div>
+                        </div>
+                        <div class="calendar-list" id="calendar-list">
+                            <div class="loading">Loading events...</div>
+                        </div>
+                    </div>
+
+                    <div class="panel reminders-panel">
+                        <div class="panel-header">
+                            <h2>Reminders Due</h2>
+                            <div class="panel-actions">
+                                <select id="reminders-days">
+                                    <option value="1">Next 24h</option>
+                                    <option value="3" selected>Next 3 days</option>
+                                    <option value="7">Next 7 days</option>
+                                    <option value="14">Next 2 weeks</option>
+                                </select>
+                                <button id="reminders-refresh" class="btn btn-secondary">Refresh</button>
+                            </div>
+                        </div>
+                        <div class="reminders-list" id="reminders-list">
+                            <div class="loading">Loading reminders...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel summary-panel">
+                    <div class="panel-header">
+                        <h2>Summary</h2>
+                    </div>
+                    <div class="summary-content" id="calendar-summary-content">
+                        <div class="empty-state">
+                            <p>Select an event or reminder to summarize</p>
+                        </div>
+                    </div>
+                    <div class="chat-container" id="calendar-chat-container" style="display: none;">
+                        <div class="chat-messages" id="calendar-chat-messages"></div>
+                        <div class="chat-input-container">
+                            <input type="text" id="calendar-chat-input" class="chat-input" placeholder="Ask a question about this item..." />
+                            <button id="calendar-chat-send" class="btn btn-primary">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-content" id="tab-messages">
+            <div class="main-content">
+                <div class="panel messages-panel">
+                    <div class="panel-header">
+                        <h2>Last 48 Hours</h2>
+                        <div class="panel-actions">
+                            <button id="messages-refresh" class="btn btn-secondary">Refresh</button>
+                        </div>
+                    </div>
+                    <div class="messages-list" id="messages-list">
+                        <div class="loading">Loading messages...</div>
+                    </div>
+                </div>
+
+                <div class="panel summary-panel">
+                    <div class="panel-header">
+                        <h2>Summary</h2>
+                    </div>
+                    <div class="summary-content" id="messages-summary-content">
+                        <div class="empty-state">
+                            <p>Select a conversation to summarize</p>
+                        </div>
+                    </div>
+                    <div class="chat-container" id="messages-chat-container" style="display: none;">
+                        <div class="chat-messages" id="messages-chat-messages"></div>
+                        <div class="chat-input-container">
+                            <input type="text" id="messages-chat-input" class="chat-input" placeholder="Ask a question about this conversation..." />
+                            <button id="messages-chat-send" class="btn btn-primary">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- All Summaries Modal -->
+        <div id="summaries-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>All Summaries</h2>
+                    <button class="close-btn">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div class="summaries-controls">
+                        <button id="clear-all-btn" class="btn btn-danger">Clear All</button>
+                    </div>
+                    <div id="all-summaries-list">
+                        <div class="loading">Loading summaries...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Daily Digest Modal -->
+        <div id="digest-modal" class="modal">
+            <div class="modal-content digest-modal-content">
+                <div class="modal-header">
+                    <h2>Daily Digest</h2>
+                    <div class="digest-header-actions">
+                        <span id="digest-timestamp" class="digest-timestamp"></span>
+                        <button id="export-digest" class="btn btn-secondary" style="display: none;">Export</button>
+                        <button class="close-btn" id="close-digest">&times;</button>
+                    </div>
+                </div>
+                <div class="modal-body">
+                    <div id="digest-content" class="digest-content">
+                        <div class="empty-state">
+                            <p>Click "Generate Daily Digest" to create your briefing</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
