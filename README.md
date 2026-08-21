@@ -91,3 +91,9 @@ codesign -d --entitlements :- \
 The retired web/runtime implementation is not part of the shipping product.
 The existing `email_summaries.db` file is intentionally left untouched as
 user data; the native app uses its own Application Support index.
+
+## License
+
+Local Digest is released under the MIT License. See [LICENSE](LICENSE) for the
+copyright notice and the permissions granted to use, copy, modify, publish,
+distribute, sublicense, and sell the software.
