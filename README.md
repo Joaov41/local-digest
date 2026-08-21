@@ -29,10 +29,6 @@ personal items.
 
 *Ask grounded questions across the sources you authorize.*
 
-![Source refresh status](screenshots/local-digest-sources.jpg)
-
-*Inspect source permissions, indexed counts, and background refresh state.*
-
 ## Permissions and sources
 
 - Contacts uses the Contacts framework.
