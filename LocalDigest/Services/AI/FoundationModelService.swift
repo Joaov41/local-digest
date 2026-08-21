@@ -20,7 +20,7 @@ enum FoundationModelError: LocalizedError, Sendable {
     }
 }
 
-@available(macOS 27.0, *)
+@available(macOS 26.0, *)
 actor FoundationModelService {
     func availability(for provider: AIProvider) -> ModelAvailability {
         switch provider {
@@ -33,6 +33,9 @@ actor FoundationModelService {
                 return ModelAvailability(isAvailable: false, detail: "On-device model unavailable: \(String(describing: reason))")
             }
         case .privateCloud:
+            guard #available(macOS 27.0, *) else {
+                return ModelAvailability(isAvailable: false, detail: "Private Cloud Compute requires macOS 27 or later.")
+            }
             guard BundleEntitlements.hasPrivateCloudCompute else {
                 return ModelAvailability(
                     isAvailable: false,
@@ -66,13 +69,6 @@ actor FoundationModelService {
                 options: GenerationOptions(maximumResponseTokens: preparedPrompt.responseTokenBudget)
             )
             return response.content
-        } catch let error as PrivateCloudComputeLanguageModel.Error {
-            switch error {
-            case .quotaLimitReached(let detail): throw FoundationModelError.quota(detail.debugDescription)
-            case .networkFailure(let detail): throw FoundationModelError.failed(detail.debugDescription)
-            case .serviceUnavailable(let detail): throw FoundationModelError.unavailable(detail.debugDescription)
-            @unknown default: throw FoundationModelError.failed(error.localizedDescription)
-            }
         } catch {
             throw FoundationModelError.failed(error.localizedDescription)
         }
@@ -80,35 +76,26 @@ actor FoundationModelService {
 
     func stream(question: String, evidence: [SearchHit], provider: AIProvider, intent: QueryIntent = .inherited, referenceDate: Date = Date()) async -> AsyncThrowingStream<String, Error> {
         let availability = availability(for: provider)
+        guard availability.isAvailable else {
+            return AsyncThrowingStream { continuation in
+                let error: FoundationModelError = availability.isQuotaLimited
+                    ? .quota(availability.detail)
+                    : .unavailable(availability.detail)
+                continuation.finish(throwing: error)
+            }
+        }
         let session = session(for: provider, intent: intent)
         let preparedPrompt = await makePrompt(question: question, evidence: evidence, provider: provider, session: session, referenceDate: referenceDate)
         return AsyncThrowingStream { continuation in
             Task {
                 do {
-                    guard availability.isAvailable else {
-                        if availability.isQuotaLimited {
-                            throw FoundationModelError.quota(availability.detail)
-                        }
-                        throw FoundationModelError.unavailable(availability.detail)
-                    }
                     let options = GenerationOptions(maximumResponseTokens: preparedPrompt.responseTokenBudget)
                     for try await snapshot in session.streamResponse(to: preparedPrompt.prompt, options: options) {
                         continuation.yield(String(describing: snapshot.content))
                     }
                     continuation.finish()
-                } catch let error as PrivateCloudComputeLanguageModel.Error {
-                    switch error {
-                    case .quotaLimitReached(let detail):
-                        continuation.finish(throwing: FoundationModelError.quota(detail.debugDescription))
-                    case .networkFailure(let detail):
-                        continuation.finish(throwing: FoundationModelError.failed(detail.debugDescription))
-                    case .serviceUnavailable(let detail):
-                        continuation.finish(throwing: FoundationModelError.unavailable(detail.debugDescription))
-                    @unknown default:
-                        continuation.finish(throwing: FoundationModelError.failed(error.localizedDescription))
-                    }
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: FoundationModelError.failed(error.localizedDescription))
                 }
             }
         }
@@ -128,6 +115,9 @@ actor FoundationModelService {
         case .appleLocal:
             created = LanguageModelSession(model: SystemLanguageModel.default, instructions: PromptBuilder.instructions)
         case .privateCloud:
+            guard #available(macOS 27.0, *) else {
+                fatalError("Private Cloud Compute requires macOS 27 or later.")
+            }
             created = LanguageModelSession(model: PrivateCloudComputeLanguageModel(), instructions: PromptBuilder.instructions)
         }
         sessions[provider] = created
@@ -141,19 +131,21 @@ actor FoundationModelService {
         case .appleLocal:
             let model = SystemLanguageModel.default
             let contextSize = PromptBuilder.normalizedContextSize(model.contextSize)
-            let instructions = Instructions(PromptBuilder.instructions)
-            if let instructionTokenCount = try? await model.tokenCount(for: instructions) {
-                return await PromptBuilder.makeModelPrompt(
-                    question: question,
-                    evidence: evidence,
-                    contextSize: contextSize,
-                    instructionTokenCount: instructionTokenCount,
-                    historyTokenCount: historyTokenCount,
-                    referenceDate: referenceDate,
-                    tokenCounter: { prompt in
-                        try await model.tokenCount(for: prompt)
-                    }
-                )
+            if #available(macOS 26.4, *) {
+                let instructions = Instructions(PromptBuilder.instructions)
+                if let instructionTokenCount = try? await model.tokenCount(for: instructions) {
+                    return await PromptBuilder.makeModelPrompt(
+                        question: question,
+                        evidence: evidence,
+                        contextSize: contextSize,
+                        instructionTokenCount: instructionTokenCount,
+                        historyTokenCount: historyTokenCount,
+                        referenceDate: referenceDate,
+                        tokenCounter: { prompt in
+                            try await model.tokenCount(for: prompt)
+                        }
+                    )
+                }
             }
             // If tokenization is unavailable while assets are warming up,
             // avoid retrying the same failing model service for every record.
@@ -166,6 +158,16 @@ actor FoundationModelService {
                 referenceDate: referenceDate
             )
         case .privateCloud:
+            guard #available(macOS 27.0, *) else {
+                return await PromptBuilder.makeModelPrompt(
+                    question: question,
+                    evidence: evidence,
+                    contextSize: PromptBuilder.fallbackContextSize,
+                    instructionTokenCount: PromptBuilder.estimatedTokenCount(for: PromptBuilder.instructions),
+                    historyTokenCount: historyTokenCount,
+                    referenceDate: referenceDate
+                )
+            }
             let model = PrivateCloudComputeLanguageModel()
             let measuredContextSize = try? await model.contextSize
             let contextSize = PromptBuilder.normalizedContextSize(measuredContextSize ?? 0)
@@ -186,7 +188,9 @@ actor FoundationModelService {
     private func trimSessionHistory(_ session: LanguageModelSession) {
         let maximumEntries = 4
         guard session.transcript.count > maximumEntries else { return }
-        session.transcript = Transcript(entries: Array(session.transcript.suffix(maximumEntries)))
+        if #available(macOS 27.0, *) {
+            session.transcript = Transcript(entries: Array(session.transcript.suffix(maximumEntries)))
+        }
     }
 
     private func sessionHistoryTokenCount(_ session: LanguageModelSession, provider: AIProvider) async -> Int {
@@ -194,7 +198,10 @@ actor FoundationModelService {
         guard !entries.isEmpty else { return 0 }
         switch provider {
         case .appleLocal:
-            return (try? await SystemLanguageModel.default.tokenCount(for: entries)) ?? PromptBuilder.estimatedTokenCount(for: entries.map(\.description).joined(separator: "\n"))
+            if #available(macOS 26.4, *) {
+                return (try? await SystemLanguageModel.default.tokenCount(for: entries)) ?? PromptBuilder.estimatedTokenCount(for: entries.map(\.description).joined(separator: "\n"))
+            }
+            return PromptBuilder.estimatedTokenCount(for: entries.map(\.description).joined(separator: "\n"))
         case .privateCloud:
             return PromptBuilder.estimatedTokenCount(for: entries.map(\.description).joined(separator: "\n"))
         }

@@ -203,4 +203,13 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
         case .privateCloud: "lock.shield"
         }
     }
+
+    var isSupportedOnCurrentOS: Bool {
+        switch self {
+        case .appleLocal:
+            if #available(macOS 26.0, *) { true } else { false }
+        case .privateCloud:
+            if #available(macOS 27.0, *) { true } else { false }
+        }
+    }
 }

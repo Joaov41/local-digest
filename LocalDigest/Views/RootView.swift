@@ -29,7 +29,7 @@ struct RootView: View {
                 }
                 .disabled(store.isIndexing)
                 Picker("AI provider", selection: Binding(get: { store.provider }, set: { store.setProvider($0) })) {
-                    ForEach(AIProvider.allCases) { provider in
+                    ForEach(AIProvider.allCases.filter(\.isSupportedOnCurrentOS)) { provider in
                         Label(provider.title, systemImage: provider.symbol).tag(provider)
                     }
                 }

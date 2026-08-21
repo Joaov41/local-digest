@@ -2,10 +2,15 @@
 
 Local Digest is a native SwiftUI macOS app for searching and understanding
 your personal archive. The shipping target is `LocalDigest.xcodeproj`, which
-targets macOS 27 and uses Apple Foundation Models:
+targets macOS 26 and uses Apple Foundation Models:
 
 - `SystemLanguageModel` for on-device answers.
-- `PrivateCloudComputeLanguageModel` for Apple Private Cloud Compute answers.
+- `PrivateCloudComputeLanguageModel` for Apple Private Cloud Compute answers on
+  macOS 27 and later.
+
+On macOS 26, the app uses the on-device model and does not offer Private Cloud
+Compute. Compatible hardware and Apple Intelligence are still required for
+the on-device model.
 
 The app builds a local SQLite FTS5 index over the sources you authorize. It
 searches historical Contacts, Calendar, Reminders, Mail, Notes, and Messages
@@ -63,15 +68,15 @@ xcodebuild -project LocalDigest.xcodeproj -scheme LocalDigest -sdk macosx \
 resolution, FTS ranking, prompt boundaries, and source permission reporting.
 It never reads personal message content.
 
-For a local run, `script/build_and_run.sh` uses the installed **Local Digest
-PCC Development** profile and launches the provisioned app. If that profile is
-not installed, it falls back to a safe Apple Local preview because macOS rejects
-restricted PCC entitlements on an ad-hoc signature. A profile and identity may
-also be supplied explicitly:
+For a local run, `script/build_and_run.sh` uses a locally configured development
+profile when one is available and launches the provisioned app. If no suitable
+profile is installed, it falls back to a safe Apple Local preview because macOS
+rejects restricted PCC entitlements on an ad-hoc signature. A profile and
+identity may also be supplied explicitly:
 
 ```sh
 LOCAL_DIGEST_SIGNING_IDENTITY='Apple Development: Your Name (…)'
-LOCAL_DIGEST_PROVISIONING_PROFILE='/path/to/Local_Digest_PCC_Development.provisionprofile'
+LOCAL_DIGEST_PROVISIONING_PROFILE='/path/to/pcc-development.provisionprofile'
 ./script/build_and_run.sh
 ```
 
@@ -86,10 +91,11 @@ working sibling macOS apps:
 - `com.apple.developer.private-cloud-compute`
 - `com.apple.security.automation.apple-events`
 
-The Debug configuration uses manual signing with development team `HNG8WV554B`
-and the **Local Digest PCC Development** profile. Release remains automatic so a
-future App Store or Developer ID distribution profile can be selected separately.
-An ad-hoc signature cannot carry the restricted PCC entitlement.
+The checked-in project intentionally leaves the developer-team identifier and
+provisioning-profile name unset. Configure signing locally in Xcode or provide
+the identity and profile paths above. Release remains automatic so a future App
+Store or Developer ID distribution profile can be selected separately. An
+ad-hoc signature cannot carry the restricted PCC entitlement.
 
 Verify a signed build with:
 

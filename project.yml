@@ -5,10 +5,9 @@ options:
 settings:
   base:
     SWIFT_VERSION: 6.0
-    MACOSX_DEPLOYMENT_TARGET: 27.0
+    MACOSX_DEPLOYMENT_TARGET: 26.0
     CURRENT_PROJECT_VERSION: 1
     MARKETING_VERSION: 1.0
-    DEVELOPMENT_TEAM: HNG8WV554B
     CODE_SIGN_STYLE: Automatic
     CODE_SIGNING_ALLOWED: YES
     CLANG_ENABLE_MODULES: YES
@@ -17,7 +16,7 @@ targets:
   LocalDigest:
     type: application
     platform: macOS
-    deploymentTarget: "27.0"
+    deploymentTarget: "26.0"
     sources:
       - path: LocalDigest
     settings:
@@ -28,11 +27,6 @@ targets:
         INFOPLIST_FILE: LocalDigest/Support/Info.plist
         CODE_SIGN_ENTITLEMENTS: LocalDigest.entitlements
         SWIFT_STRICT_CONCURRENCY: targeted
-      configs:
-        Debug:
-          CODE_SIGN_STYLE: Manual
-          CODE_SIGN_IDENTITY: Apple Development
-          PROVISIONING_PROFILE_SPECIFIER: Local Digest PCC Development
     frameworks:
       - Contacts.framework
       - EventKit.framework
@@ -41,7 +35,7 @@ targets:
   LocalDigestTests:
     type: bundle.unit-test
     platform: macOS
-    deploymentTarget: "27.0"
+    deploymentTarget: "26.0"
     sources:
       - path: LocalDigestTests
     dependencies:

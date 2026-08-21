@@ -7,10 +7,10 @@ struct SettingsView: View {
         Form {
             Section("Answer provider") {
                 Picker("Default provider", selection: Binding(get: { store.provider }, set: { store.setProvider($0) })) {
-                    ForEach(AIProvider.allCases) { provider in Label(provider.title, systemImage: provider.symbol).tag(provider) }
+                    ForEach(AIProvider.allCases.filter(\.isSupportedOnCurrentOS)) { provider in Label(provider.title, systemImage: provider.symbol).tag(provider) }
                 }
                 .disabled(store.isAnswering)
-                ForEach(AIProvider.allCases) { provider in
+                ForEach(AIProvider.allCases.filter(\.isSupportedOnCurrentOS)) { provider in
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Image(systemName: provider.symbol)
                             .foregroundStyle(Color.accentColor)
@@ -31,6 +31,11 @@ struct SettingsView: View {
                             ProgressView().controlSize(.small)
                         }
                     }
+                }
+                if #unavailable(macOS 27.0) {
+                    Text("On macOS 26, answers use the on-device model. Private Cloud Compute requires macOS 27 or later.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Text("On-Device keeps generation on this Mac. Private Cloud Compute is an Apple service and receives only the bounded evidence used for the current answer.")
                     .font(.caption)

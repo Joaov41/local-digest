@@ -40,7 +40,7 @@ final class AppStore: ObservableObject {
            let saved = try? JSONDecoder().decode([SavedAnswer].self, from: data) {
             savedAnswers = saved
         }
-        if #available(macOS 27.0, *) { modelService = FoundationModelService() } else { modelService = nil }
+        if #available(macOS 26.0, *) { modelService = FoundationModelService() } else { modelService = nil }
     }
 
     func refresh() async {
@@ -55,7 +55,7 @@ final class AppStore: ObservableObject {
     }
 
     func refreshModelAvailability() async {
-        guard let modelService, #available(macOS 27.0, *) else { return }
+        guard let modelService else { return }
         for provider in AIProvider.allCases {
             let availability = await modelService.availability(for: provider)
             modelAvailability[provider] = availability
@@ -78,6 +78,12 @@ final class AppStore: ObservableObject {
 
     func setProvider(_ newProvider: AIProvider) {
         guard !isAnswering else { return }
+        if newProvider == .privateCloud {
+            guard #available(macOS 27.0, *) else {
+                provider = .appleLocal
+                return
+            }
+        }
         provider = newProvider
     }
 
@@ -170,7 +176,7 @@ final class AppStore: ObservableObject {
             if plan.mode == .exactLookup, requestProvider == .appleLocal {
                 answerText = groundedExactAnswer(for: plan, hits: hits)
             } else {
-                guard let modelService, #available(macOS 27.0, *) else { throw FoundationModelError.unavailable("Apple Foundation Models require macOS 27.") }
+                guard let modelService else { throw FoundationModelError.unavailable("Apple Foundation Models require macOS 26 or later.") }
                 for try await chunk in await modelService.stream(question: query, evidence: hits, provider: requestProvider, intent: plan.intent, referenceDate: requestDate) {
                     answerText = PromptBuilder.sanitizedAnswer(chunk, referenceDate: requestDate)
                 }

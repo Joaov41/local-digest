@@ -29,7 +29,7 @@ else
   echo "The PCC development profile is unavailable; falling back to an Apple Local preview." >&2
   xcodebuild -project "$ROOT_DIR/LocalDigest.xcodeproj" -scheme LocalDigest -configuration Debug -sdk macosx -derivedDataPath "$DERIVED_DATA" CODE_SIGNING_ALLOWED=NO build
   /usr/bin/codesign --force --deep --sign - --entitlements "$PREVIEW_ENTITLEMENTS" "$APP_BUNDLE" >/dev/null
-  echo "Built a local preview. Apple Local works; PCC needs the Local Digest PCC Development profile."
+  echo "Built a local preview. Apple Local works; PCC needs a locally configured development profile."
 fi
 
 case "$MODE" in
