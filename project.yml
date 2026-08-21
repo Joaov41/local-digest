@@ -1,0 +1,66 @@
+name: LocalDigest
+options:
+  minimumXcodeGenVersion: 2.40.0
+  developmentLanguage: en
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+    MACOSX_DEPLOYMENT_TARGET: 27.0
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 1.0
+    DEVELOPMENT_TEAM: HNG8WV554B
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGNING_ALLOWED: YES
+    CLANG_ENABLE_MODULES: YES
+    SWIFT_EMIT_LOC_STRINGS: YES
+targets:
+  LocalDigest:
+    type: application
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: LocalDigest
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.web.me.LocalDigest
+        PRODUCT_NAME: Local Digest
+        PRODUCT_MODULE_NAME: LocalDigest
+        INFOPLIST_FILE: LocalDigest/Support/Info.plist
+        CODE_SIGN_ENTITLEMENTS: LocalDigest.entitlements
+        SWIFT_STRICT_CONCURRENCY: targeted
+      configs:
+        Debug:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Development
+          PROVISIONING_PROFILE_SPECIFIER: Local Digest PCC Development
+    frameworks:
+      - Contacts.framework
+      - EventKit.framework
+      - FoundationModels.framework
+      - Security.framework
+  LocalDigestTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: LocalDigestTests
+    dependencies:
+      - target: LocalDigest
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.web.me.LocalDigest.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Local Digest.app/Contents/MacOS/Local Digest"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  LocalDigest:
+    build:
+      targets:
+        LocalDigest: all
+        LocalDigestTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - LocalDigestTests

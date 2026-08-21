@@ -31,3 +31,4 @@ ENV/
 *.egg-info/
 dist/
 build/
+DerivedData/
