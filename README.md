@@ -18,6 +18,16 @@ Retrieved content is treated as untrusted data. It cannot change the
 assistant's instructions, and the app never sends, edits, deletes, or creates
 personal items.
 
+## Screenshots
+
+![Ask across your life](screenshots/local-digest-ask.jpg)
+
+*Ask grounded questions across the sources you authorize.*
+
+![Source refresh status](screenshots/local-digest-sources.jpg)
+
+*Inspect source permissions, indexed counts, and background refresh state.*
+
 ## Permissions and sources
 
 - Contacts uses the Contacts framework.
