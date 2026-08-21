@@ -25,7 +25,7 @@ For answers, the project supports Apple’s on-device Foundation Model and an op
 
 This is an early macOS 27 project, not a finished App Store release yet. I’m sharing the code and would love feedback on the source adapters, permissions model, and the kinds of questions you would want to ask across your own archive:
 
-https://github.com/Joaov41/local-digest/tree/codex/publish-native-local-digest
+https://github.com/Joaov41/local-digest/tree/native-local-digest
 
 ## X
 
@@ -45,6 +45,6 @@ Sync and full rebuild run in the background while the last completed snapshot st
 
 Answers can use Apple’s on-device Foundation Model or Private Cloud Compute. With PCC selected, only bounded evidence for the current answer is sent to Apple’s service.
 
-Early macOS 27 project: https://github.com/Joaov41/local-digest/tree/codex/publish-native-local-digest
+Early macOS 27 project: https://github.com/Joaov41/local-digest/tree/native-local-digest
 
 #macOS #SwiftUI #AppleDeveloper
