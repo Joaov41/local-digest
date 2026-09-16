@@ -83,8 +83,23 @@ actor SQLiteIndex {
     }
 
     private func insert(_ records: [IndexedRecord], into database: OpaquePointer) throws {
+        let sql = "INSERT INTO records(id, source, title, body, author, participants, timestamp, url, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET source=excluded.source, title=excluded.title, body=excluded.body, author=excluded.author, participants=excluded.participants, timestamp=excluded.timestamp, url=excluded.url, thread_id=excluded.thread_id;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw currentError() }
+        defer { sqlite3_finalize(statement) }
         for record in records {
-            try insert(record, into: database)
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            bind(record.id, to: statement, index: 1)
+            bind(record.source.rawValue, to: statement, index: 2)
+            bind(record.title, to: statement, index: 3)
+            bind(record.body, to: statement, index: 4)
+            bind(record.author, to: statement, index: 5)
+            bind(record.participants.joined(separator: "\u{1F}"), to: statement, index: 6)
+            sqlite3_bind_double(statement, 7, record.timestamp.timeIntervalSince1970)
+            bind(record.url?.absoluteString, to: statement, index: 8)
+            bind(record.threadID, to: statement, index: 9)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw currentError() }
         }
     }
 
@@ -131,6 +146,10 @@ actor SQLiteIndex {
 
     nonisolated func count(source: SourceKind) async throws -> Int {
         try await reader.count(source: source)
+    }
+
+    nonisolated func conversation(threadID: String, limit: Int = 80) async throws -> [SearchHit] {
+        try await reader.conversation(threadID: threadID, limit: limit)
     }
 
     private func execute(_ sql: String) throws {
@@ -192,8 +211,16 @@ private actor SQLiteIndexReader {
         if plan.constraints.endDate != nil { predicates.append("records.timestamp < ?") }
         let join = ftsQuery == nil ? "" : "JOIN records_fts ON records_fts.rowid = records.rowid"
         let score = ftsQuery == nil ? "0.0" : "bm25(records_fts)"
-        let ordering = ftsQuery == nil ? "records.timestamp DESC" : "bm25(records_fts) ASC, records.timestamp DESC"
-        let sql = "SELECT records.id, records.source, records.title, records.body, records.author, records.participants, records.timestamp, records.url, records.thread_id, \(score) FROM records \(join) WHERE \(predicates.joined(separator: " AND ")) ORDER BY \(ordering) LIMIT ?;"
+        let ordering: String
+        if plan.ordering == .newestFirst {
+            ordering = "records.timestamp DESC"
+        } else if plan.ordering == .upcomingFirst {
+            ordering = "records.timestamp ASC"
+        } else {
+            ordering = ftsQuery == nil ? "records.timestamp DESC" : "bm25(records_fts) ASC, records.timestamp DESC"
+        }
+        let limitClause = plan.constraints.personTerms.isEmpty ? " LIMIT ?" : ""
+        let sql = "SELECT records.id, records.source, records.title, records.body, records.author, records.participants, records.timestamp, records.url, records.thread_id, \(score) FROM records \(join) WHERE \(predicates.joined(separator: " AND ")) ORDER BY \(ordering)\(limitClause);"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw currentError() }
         defer { sqlite3_finalize(statement) }
@@ -211,7 +238,9 @@ private actor SQLiteIndexReader {
             sqlite3_bind_double(statement, next, endDate.timeIntervalSince1970)
             next += 1
         }
-        sqlite3_bind_int(statement, next, Int32(max(safeLimit * 20, 5000)))
+        if plan.constraints.personTerms.isEmpty {
+            sqlite3_bind_int(statement, next, Int32(max(safeLimit * 20, 5000)))
+        }
 
         var hits: [SearchHit] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -237,10 +266,17 @@ private actor SQLiteIndexReader {
                 matchedSnippet: matchedSnippet(for: record, terms: plan.keywords)
             ))
         }
-        let ranked = Array(hits.sorted {
-            if $0.score == $1.score { return $0.record.timestamp > $1.record.timestamp }
-            return $0.score > $1.score
-        }.prefix(safeLimit))
+        let ranked: [SearchHit]
+        if plan.ordering == .newestFirst {
+            ranked = Array(hits.sorted { $0.record.timestamp > $1.record.timestamp }.prefix(safeLimit))
+        } else if plan.ordering == .upcomingFirst {
+            ranked = Array(hits.sorted { $0.record.timestamp < $1.record.timestamp }.prefix(safeLimit))
+        } else {
+            ranked = Array(hits.sorted {
+                if $0.score == $1.score { return $0.record.timestamp > $1.record.timestamp }
+                return $0.score > $1.score
+            }.prefix(safeLimit))
+        }
         let titleExact = plan.mode == .exactLookup
             ? ranked.filter { record in
                 let normalizedTitle = record.record.title
@@ -292,11 +328,18 @@ private actor SQLiteIndexReader {
             let participants = sqlite3_column_text(statement, 3).map {
                 String(cString: $0).split(separator: "\u{1F}").map(String.init)
             } ?? []
+            let aliases = body
+                .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            let handles = participants
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
             result.append(ContactIdentity(
                 id: String(cString: id),
                 displayName: String(cString: title),
-                aliases: body.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init),
-                handles: participants
+                aliases: aliases,
+                handles: handles
             ))
         }
         return result
@@ -311,6 +354,26 @@ private actor SQLiteIndexReader {
         bind(source.rawValue, to: statement, index: 1)
         guard sqlite3_step(statement) == SQLITE_ROW else { throw currentError() }
         return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    /// Full chronological thread content for reply drafting. This is a
+    /// deliberate read of an entire conversation, so it is only exposed for
+    /// records the user explicitly selected.
+    func conversation(threadID: String, limit: Int) throws -> [SearchHit] {
+        guard let database = try openIfAvailable() else { return [] }
+        let safeLimit = max(1, min(limit, 200))
+        let sql = "SELECT records.id, records.source, records.title, records.body, records.author, records.participants, records.timestamp, records.url, records.thread_id, 0.0 FROM records WHERE records.thread_id = ? ORDER BY records.timestamp ASC LIMIT ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw currentError() }
+        defer { sqlite3_finalize(statement) }
+        bind(threadID, to: statement, index: 1)
+        sqlite3_bind_int(statement, 2, Int32(safeLimit))
+        var hits: [SearchHit] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let record = record(from: statement) else { continue }
+            hits.append(SearchHit(record: record, score: 0))
+        }
+        return hits
     }
 
     private func openIfAvailable() throws -> OpaquePointer? {
@@ -361,7 +424,7 @@ private actor SQLiteIndexReader {
     }
 
     private func makeFTSQuery(for plan: QueryPlan) -> String? {
-        let rawTerms: [String] = (plan.keywords + plan.constraints.personTerms).compactMap { term in
+        let rawTerms: [String] = plan.keywords.compactMap { term in
             let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }
@@ -393,8 +456,10 @@ private actor SQLiteIndexReader {
         if let start = constraints.startDate, record.timestamp < start { return false }
         if let end = constraints.endDate, record.timestamp >= end { return false }
         if !constraints.personTerms.isEmpty {
-            let haystack = record.searchableText
-            guard constraints.personTerms.contains(where: { haystack.localizedCaseInsensitiveContains($0) }) else { return false }
+            let identityFields = [record.author].compactMap { $0 } + record.participants
+            guard constraints.personTerms.contains(where: { term in
+                identityFields.contains { field in IdentityResolver.matchesSearchTerm(term, against: field) }
+            }) else { return false }
         }
         return true
     }

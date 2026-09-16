@@ -8,7 +8,10 @@ struct LocalDigestApp: App {
         WindowGroup("Local Digest") {
             RootView()
                 .environmentObject(store)
-                .task { await store.refresh() }
+                .task {
+                    await store.refresh()
+                    store.startAutoSync()
+                }
         }
         .defaultSize(width: 1180, height: 760)
         .commands {

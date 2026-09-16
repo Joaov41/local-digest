@@ -13,6 +13,12 @@ struct SearchView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if !store.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !store.hits.isEmpty {
+                    Button("Clear") { store.clearSearch() }
+                        .buttonStyle(.bordered)
+                        .accessibilityLabel("Clear search")
+                        .accessibilityHint("Removes the search text and displayed results")
+                }
                 if store.isSearching { ProgressView().controlSize(.small) }
             }
             .padding(.horizontal, 32)
@@ -24,6 +30,16 @@ struct SearchView: View {
                     SearchResultRow(hit: hit)
                         .listRowSeparator(.visible)
                         .listRowBackground(Color.clear)
+                        .contextMenu {
+                            if hit.record.source == .mail || hit.record.source == .messages {
+                                Button {
+                                    Task { await store.requestReplyDraft(for: hit) }
+                                } label: {
+                                    Label("Draft reply", systemImage: "paperplane")
+                                }
+                                .disabled(store.isDrafting)
+                            }
+                        }
                 }
                 .listStyle(.inset)
             }

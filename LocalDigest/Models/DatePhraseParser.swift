@@ -95,9 +95,31 @@ struct DatePhraseParser: Sendable {
            let day = Int(dayText) {
             let month = monthNumber(for: monthName)
             let year = Int(capture(match, in: text, at: 3) ?? "") ?? calendar.component(.year, from: reference)
-            if let month, let date = calendar.date(from: DateComponents(year: year, month: month, day: day)) {
+            if let month, let date = validatedDate(year: year, month: month, day: day) {
                 return dayInterval(for: date, phrase: String(text[Range(match.range, in: text)!]))
             }
+        }
+
+        // Day-first numeric dates are common in the user's locale. A missing
+        // year means the year of the fixed reference date used by the planner.
+        let dayFirstPattern = #"\b([0-9]{1,2})[/.]([0-9]{1,2})(?:[/.]([0-9]{4}))?\b"#
+        if let match = firstMatch(dayFirstPattern, in: text),
+           let day = Int(capture(match, in: text, at: 1) ?? ""),
+           let month = Int(capture(match, in: text, at: 2) ?? "") {
+            let year = Int(capture(match, in: text, at: 3) ?? "") ?? calendar.component(.year, from: reference)
+            if let date = validatedDate(year: year, month: month, day: day) {
+                return dayInterval(for: date, phrase: String(text[Range(match.range, in: text)!]))
+            }
+            return nil
+        }
+
+        let dayFirstDashPattern = #"\b([0-9]{1,2})-([0-9]{1,2})-([0-9]{4})\b"#
+        if let match = firstMatch(dayFirstDashPattern, in: text),
+           let day = Int(capture(match, in: text, at: 1) ?? ""),
+           let month = Int(capture(match, in: text, at: 2) ?? ""),
+           let year = Int(capture(match, in: text, at: 3) ?? ""),
+           let date = validatedDate(year: year, month: month, day: day) {
+            return dayInterval(for: date, phrase: String(text[Range(match.range, in: text)!]))
         }
 
         let isoPattern = #"\b([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})\b"#
@@ -105,10 +127,22 @@ struct DatePhraseParser: Sendable {
            let year = Int(capture(match, in: text, at: 1) ?? ""),
            let month = Int(capture(match, in: text, at: 2) ?? ""),
            let day = Int(capture(match, in: text, at: 3) ?? ""),
-           let date = calendar.date(from: DateComponents(year: year, month: month, day: day)) {
+           let date = validatedDate(year: year, month: month, day: day) {
             return dayInterval(for: date, phrase: String(text[Range(match.range, in: text)!]))
         }
         return nil
+    }
+
+    private func validatedDate(year: Int, month: Int, day: Int) -> Date? {
+        var components = DateComponents()
+        components.era = 1
+        components.year = year
+        components.month = month
+        components.day = day
+        guard let date = calendar.date(from: components) else { return nil }
+        let resolved = calendar.dateComponents([.era, .year, .month, .day], from: date)
+        guard resolved.era == 1, resolved.year == year, resolved.month == month, resolved.day == day else { return nil }
+        return date
     }
 
     private func dayInterval(for date: Date, phrase: String) -> DateParseResult {

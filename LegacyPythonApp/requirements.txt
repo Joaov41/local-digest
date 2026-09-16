@@ -1,0 +1,6 @@
+Flask==3.0.0
+flask-cors==4.0.0
+requests==2.31.0
+numpy<2
+mlx; platform_system == "Darwin" and platform_machine == "arm64"
+mlx-lm; platform_system == "Darwin" and platform_machine == "arm64"

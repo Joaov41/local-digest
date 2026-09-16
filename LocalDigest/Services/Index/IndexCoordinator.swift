@@ -50,10 +50,10 @@ actor IndexCoordinator {
     }
 
     func indexAll(progress: @Sendable @escaping (SourceKind, Int, Int) -> Void) async -> [SourceStatus] {
-        await indexAll(mode: .incremental, progress: progress)
+        await indexAll(mode: .incremental, progress: progress, detail: { _, _ in })
     }
 
-    func indexAll(mode: IndexRefreshMode, progress: @Sendable @escaping (SourceKind, Int, Int) -> Void) async -> [SourceStatus] {
+    func indexAll(mode: IndexRefreshMode, progress: @Sendable @escaping (SourceKind, Int, Int) -> Void, detail: @escaping @Sendable (SourceKind, String?) -> Void = { _, _ in }) async -> [SourceStatus] {
         // A second manual sync observes the current committed snapshot and
         // returns immediately. It must never start a second source fetch.
         guard !refreshInProgress else { return await statuses() }
@@ -79,7 +79,9 @@ actor IndexCoordinator {
                     // Writes remain serialized by SQLiteIndex's actor.
                     progress(adapter.source, 0, -1)
                     do {
-                        let batch = try await adapter.fetchRecords(mode: mode, cursor: cursor)
+                        let batch = try await adapter.fetchRecords(mode: mode, cursor: cursor) { message in
+                            detail(adapter.source, message)
+                        }
                         guard !Task.isCancelled else { return .cancelled(adapter.source) }
                         return .batch(
                             adapter.source,
@@ -95,8 +97,8 @@ actor IndexCoordinator {
 
             for await result in group {
                 switch result {
-                case .skipped:
-                    break
+                case .skipped(let source):
+                    detail(source, nil)
                 case .batch(let source, let batch, let replace):
                     do {
                         guard !Task.isCancelled else { continue }
@@ -122,16 +124,20 @@ actor IndexCoordinator {
                             }
                         }
                         indexMessages[source] = nil
+                        detail(source, nil)
                         progress(source, committedCount, committedCount)
                     } catch {
                         indexMessages[source] = error.localizedDescription
+                        detail(source, error.localizedDescription)
                         progress(source, -1, -1)
                     }
                 case .failure(let source, let message):
                     indexMessages[source] = message
+                    detail(source, message)
                     progress(source, -1, -1)
                 case .cancelled(let source):
                     indexMessages[source] = "Indexing was cancelled before the snapshot was replaced."
+                    detail(source, indexMessages[source])
                     progress(source, -1, -1)
                 }
             }
@@ -144,12 +150,13 @@ actor IndexCoordinator {
     /// useful immediately after a relaunch without re-reading source data.
     private func hydratePersistentStateIfNeeded() async {
         guard !didHydratePersistentState else { return }
-        try? await index.prepare()
+        guard (try? await index.prepare()) != nil else { return }
+        var hydratedCounts: [SourceKind: Int] = [:]
         for source in SourceKind.allCases {
-            if let count = try? await index.count(source: source) {
-                indexedCounts[source] = count
-            }
+            guard let count = try? await index.count(source: source) else { return }
+            hydratedCounts[source] = count
         }
+        indexedCounts.merge(hydratedCounts) { _, new in new }
         didHydratePersistentState = true
     }
 
@@ -161,8 +168,12 @@ actor IndexCoordinator {
         "LocalDigest.cursor.\(source.rawValue)"
     }
 
-    func search(plan: QueryPlan) async throws -> [SearchHit] {
-        try await index.search(plan: plan)
+    func search(plan: QueryPlan, limit: Int = 60) async throws -> [SearchHit] {
+        try await index.search(plan: plan, limit: limit)
+    }
+
+    func conversation(threadID: String, limit: Int = 80) async throws -> [SearchHit] {
+        try await index.conversation(threadID: threadID, limit: limit)
     }
 
     func people() async throws -> [String] { try await index.allPeople() }

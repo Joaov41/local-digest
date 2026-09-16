@@ -21,7 +21,12 @@ citations.
 
 Retrieved content is treated as untrusted data. It cannot change the
 assistant's instructions, and the app never sends, edits, deletes, or creates
-personal items.
+personal items on its own. The one exception is explicit reply drafting: when
+you ask Local Digest to reply to someone, it drafts a response grounded in
+the indexed conversation and shows it for review. Nothing is ever sent until
+you edit, approve, and confirm the send in the review sheet. Sending goes
+through Mail.app or Messages.app automation on this Mac; Messages sending is
+unofficial because macOS has no public send API.
 
 ## Screenshots
 
@@ -105,8 +110,12 @@ codesign -d --entitlements :- \
 ```
 
 The retired web/runtime implementation is not part of the shipping product.
-The existing `email_summaries.db` file is intentionally left untouched as
-user data; the native app uses its own Application Support index.
+The retired Python/Flask/MLX implementation is preserved under
+[`LegacyPythonApp/`](LegacyPythonApp/) for reference and historical use. It is
+not included by `LocalDigest.xcodeproj`, is not used by the native runtime, and
+has its own dependencies and build scripts. The existing `email_summaries.db`
+file is intentionally left untouched as user data; the native app uses its own
+Application Support index.
 
 ## License
 

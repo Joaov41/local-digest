@@ -33,12 +33,19 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
     }
 
     func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?) async throws -> SourceFetchBatch {
+        try await fetchRecords(mode: mode, cursor: cursor, progress: { _ in })
+    }
+
+    func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?, progress: @escaping @Sendable (String) -> Void) async throws -> SourceFetchBatch {
         guard await status().permission == .authorized else { throw SourceAdapterError.permissionDenied(source, "Allow Mail automation in System Settings.") }
-        let mailboxes = try await Self.mailboxes()
+        let mailboxes = mode == .incremental && cursor != nil
+            ? try await Self.mailboxReferences()
+            : try await Self.mailboxes()
         var records: [IndexedRecord] = []
         if mode == .incremental, let cursor {
             let lookback = Self.lookbackSeconds(for: cursor)
-            for mailbox in mailboxes {
+            for (offset, mailbox) in mailboxes.enumerated() {
+                progress(Self.mailboxProgressLabel(index: offset + 1, total: mailboxes.count))
                 let script = Self.incrementalRecordsScript(
                     accountIndex: mailbox.accountIndex,
                     mailboxIndex: mailbox.mailboxIndex,
@@ -108,12 +115,75 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
         }
     }
 
+    /// Incremental sync only needs stable account/mailbox references. Counting
+    /// every message in every mailbox is an expensive Apple Event and adds no
+    /// value when the received-date predicate below performs the real filter.
+    private static func mailboxReferences() async throws -> [Mailbox] {
+        let script = """
+        tell application "Mail"
+            set output to ""
+            set fieldSeparator to ASCII character 31
+            set recordSeparator to ASCII character 30
+            set accountIndex to 0
+            repeat with a in every account
+                set accountIndex to accountIndex + 1
+                set mailboxIndex to 0
+                repeat with mb in every mailbox of a
+                    set mailboxIndex to mailboxIndex + 1
+                    set output to output & (accountIndex as text) & fieldSeparator & (mailboxIndex as text) & recordSeparator
+                end repeat
+            end repeat
+            return output
+        end tell
+        """
+        let value = try await AppleScriptRunner.run(script, source: .mail)
+        return value.split(separator: "\u{1E}", omittingEmptySubsequences: true).compactMap { record in
+            let fields = record.split(separator: "\u{1F}", maxSplits: 1).compactMap { Int($0) }
+            guard fields.count == 2, fields[0] > 0, fields[1] > 0 else { return nil }
+            return Mailbox(accountIndex: fields[0], mailboxIndex: fields[1], messageCount: 0)
+        }
+    }
+
+    static func mailboxReferencesScript() -> String {
+        """
+        tell application "Mail"
+            set output to ""
+            set fieldSeparator to ASCII character 31
+            set recordSeparator to ASCII character 30
+            set accountIndex to 0
+            repeat with a in every account
+                set accountIndex to accountIndex + 1
+                set mailboxIndex to 0
+                repeat with mb in every mailbox of a
+                    set mailboxIndex to mailboxIndex + 1
+                    set output to output & (accountIndex as text) & fieldSeparator & (mailboxIndex as text) & recordSeparator
+                end repeat
+            end repeat
+            return output
+        end tell
+        """
+    }
+
+    static func mailboxProgressLabel(index: Int, total: Int) -> String {
+        "Mail mailbox \(index) of \(total)"
+    }
+
     private static func recordsScript(for mailbox: Mailbox, range: ClosedRange<Int>) -> String {
         recordsScript(accountIndex: mailbox.accountIndex, mailboxIndex: mailbox.mailboxIndex, range: range)
     }
 
     static func recordsScript(accountIndex: Int, mailboxIndex: Int, range: ClosedRange<Int>) -> String {
         """
+        on pad(n)
+            if n < 10 then return "0" & (n as text)
+            return n as text
+        end pad
+
+        on isoDate(d)
+            set t to time of d
+            return (year of d as text) & "-" & my pad(month of d as integer) & "-" & my pad(day of d) & " " & my pad(t div 3600) & ":" & my pad((t mod 3600) div 60) & ":" & my pad(t mod 60)
+        end isoDate
+
         tell application "Mail"
             set output to ""
             set fieldSeparator to ASCII character 31
@@ -126,7 +196,7 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
                 if currentCount < endIndex then set endIndex to currentCount
                 repeat with m in (messages \(range.lowerBound) thru endIndex of targetMailbox)
                     try
-                        set output to output & (id of m as text) & fieldSeparator & (subject of m as text) & fieldSeparator & (sender of m as text) & fieldSeparator & (date received of m as text) & fieldSeparator & (content of m as text) & recordSeparator
+                        set output to output & (id of m as text) & fieldSeparator & (subject of m as text) & fieldSeparator & (sender of m as text) & fieldSeparator & (my isoDate(date received of m)) & fieldSeparator & (content of m as text) & recordSeparator
                     end try
                 end repeat
             end if
@@ -137,6 +207,16 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
 
     static func incrementalRecordsScript(accountIndex: Int, mailboxIndex: Int, lookbackSeconds: Int) -> String {
         """
+        on pad(n)
+            if n < 10 then return "0" & (n as text)
+            return n as text
+        end pad
+
+        on isoDate(d)
+            set t to time of d
+            return (year of d as text) & "-" & my pad(month of d as integer) & "-" & my pad(day of d) & " " & my pad(t div 3600) & ":" & my pad((t mod 3600) div 60) & ":" & my pad(t mod 60)
+        end isoDate
+
         tell application "Mail"
             set output to ""
             set fieldSeparator to ASCII character 31
@@ -146,7 +226,7 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
             set targetMailbox to mailbox \(mailboxIndex) of targetAccount
             repeat with m in (messages of targetMailbox whose date received is greater than or equal to cutoffDate)
                 try
-                    set output to output & (id of m as text) & fieldSeparator & (subject of m as text) & fieldSeparator & (sender of m as text) & fieldSeparator & (date received of m as text) & fieldSeparator & (content of m as text) & recordSeparator
+                    set output to output & (id of m as text) & fieldSeparator & (subject of m as text) & fieldSeparator & (sender of m as text) & fieldSeparator & (my isoDate(date received of m)) & fieldSeparator & (content of m as text) & recordSeparator
                 end try
             end repeat
             return output
@@ -156,7 +236,9 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
 
     static func lookbackSeconds(for cursor: SourceCursor, now: Date = Date()) -> Int {
         guard let watermark = cursor.watermark else { return 7 * 24 * 60 * 60 }
-        return max(7 * 24 * 60 * 60, Int(now.timeIntervalSince(watermark)) + 7 * 24 * 60 * 60)
+        let minimum = 7 * 24 * 60 * 60
+        let age = max(0, Int(now.timeIntervalSince(watermark)))
+        return age <= minimum ? minimum : age + minimum
     }
 
     private static func parse(_ value: String) -> [IndexedRecord] {
@@ -164,8 +246,16 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
             let fields = record.split(separator: "\u{1F}", maxSplits: 4).map(String.init)
             guard fields.count == 5 else { return nil }
             let date = DateParser.parse(fields[3]) ?? .distantPast
-            return IndexedRecord(id: "mail-\(fields[0])", source: .mail, title: fields[1], body: fields[4], author: fields[2], participants: [fields[2]], timestamp: date, url: nil, threadID: nil)
+            let threadKey = Self.mailThreadKey(from: fields[1])
+            return IndexedRecord(id: "mail-\(fields[0])", source: .mail, title: fields[1], body: fields[4], author: fields[2], participants: [fields[2]], timestamp: date, url: nil, threadID: threadKey)
         }
+    }
+
+    static func mailThreadKey(from subject: String) -> String {
+        let normalized = subject.replacingOccurrences(of: #"^(?i:(re|fw|fwd):\s*)+"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+        return "mail-thread-" + normalized
     }
 
     private static func nextCursor(_ records: [IndexedRecord], prior: SourceCursor?) -> SourceCursor? {
@@ -206,11 +296,11 @@ final class NotesSourceAdapter: SourceAdapter, @unchecked Sendable {
         let lookback = mode == .incremental && cursor != nil ? MailSourceAdapter.lookbackSeconds(for: cursor!) : nil
         let script = Self.recordsScript(lookbackSeconds: lookback)
         let value = try await AppleScriptRunner.run(script, source: source)
-        let records = value.split(separator: "\u{1E}", omittingEmptySubsequences: true).compactMap { record -> IndexedRecord? in
+        let records = await MainActor.run { value.split(separator: "\u{1E}", omittingEmptySubsequences: true).compactMap { record -> IndexedRecord? in
             let fields = record.split(separator: "\u{1F}", maxSplits: 3).map(String.init)
             guard fields.count == 4 else { return nil }
             return IndexedRecord(id: "note-\(fields[0])", source: .notes, title: fields[1], body: Self.htmlToPlainText(fields[2]), author: nil, participants: [], timestamp: DateParser.parse(fields[3]) ?? .distantPast, url: nil, threadID: nil)
-        }
+        } }
         let nextCursor = records.filter { $0.timestamp != .distantPast }.max(by: { $0.timestamp < $1.timestamp }).map {
             SourceCursor(watermark: $0.timestamp, rawWatermark: nil, rowID: nil, stableID: $0.id)
         } ?? cursor
@@ -221,6 +311,16 @@ final class NotesSourceAdapter: SourceAdapter, @unchecked Sendable {
         let cutoff = lookbackSeconds.map { "set cutoffDate to (current date) - \($0)" } ?? ""
         let filter = lookbackSeconds == nil ? "" : " whose modification date is greater than or equal to cutoffDate"
         return """
+        on pad(n)
+            if n < 10 then return "0" & (n as text)
+            return n as text
+        end pad
+
+        on isoDate(d)
+            set t to time of d
+            return (year of d as text) & "-" & my pad(month of d as integer) & "-" & my pad(day of d) & " " & my pad(t div 3600) & ":" & my pad((t mod 3600) div 60) & ":" & my pad(t mod 60)
+        end isoDate
+
         tell application "Notes"
             set output to ""
             set fieldSeparator to ASCII character 31
@@ -231,10 +331,10 @@ final class NotesSourceAdapter: SourceAdapter, @unchecked Sendable {
                     try
                         set timestampText to ""
                         try
-                            set timestampText to (modification date of n as text)
+                            set timestampText to (my isoDate(modification date of n))
                         on error
                             try
-                                set timestampText to (creation date of n as text)
+                                set timestampText to (my isoDate(creation date of n))
                             end try
                         end try
                         set output to output & (id of n as text) & fieldSeparator & (name of n as text) & fieldSeparator & (body of n as text) & fieldSeparator & timestampText & recordSeparator
@@ -246,6 +346,7 @@ final class NotesSourceAdapter: SourceAdapter, @unchecked Sendable {
         """
     }
 
+    @MainActor
     static func htmlToPlainText(_ html: String) -> String {
         guard !html.isEmpty else { return "" }
         if let data = html.data(using: .utf8),
@@ -321,6 +422,7 @@ enum AppleScriptRunner {
         switch source {
         case .mail: "com.apple.mail"
         case .notes: "com.apple.Notes"
+        case .messages: "com.apple.iChat"
         default: nil
         }
     }

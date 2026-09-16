@@ -42,6 +42,14 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section("Index") {
+                Picker("Automatic sync", selection: Binding(get: { store.autoSyncInterval }, set: { store.setAutoSync($0) })) {
+                    ForEach(AutoSyncInterval.allCases) { interval in
+                        Text(interval.title).tag(interval)
+                    }
+                }
+                Text("New and changed items are fetched in the background on this cadence. Full Rebuild stays manual for reconciling deletions.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Text("The index is stored locally in Application Support/Local Digest/index.sqlite. Local Digest is read-only and never sends, edits, deletes, or creates personal items.")
                     .font(.caption)
                     .foregroundStyle(.secondary)

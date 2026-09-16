@@ -79,15 +79,26 @@ final class RemindersSourceAdapter: SourceAdapter, @unchecked Sendable {
         guard await status().permission == .authorized else { throw SourceAdapterError.permissionDenied(source, "Allow Reminders access in System Settings.") }
         let predicate = store.predicateForReminders(in: nil)
         var records: [IndexedRecord] = []
+        let gate = SingleDeliveryGate<[EKReminder]>()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             store.fetchReminders(matching: predicate) { reminders in
-                records = (reminders ?? []).map { reminder in
-                    IndexedRecord(id: "reminder-\(reminder.calendarItemIdentifier)", source: .reminders, title: reminder.title, body: reminder.notes ?? "", author: reminder.calendar?.title, participants: [], timestamp: reminder.dueDateComponents.flatMap { Calendar.current.date(from: $0) } ?? .distantPast, url: nil, threadID: nil)
+                guard let reminders = gate.deliver(reminders ?? []) else { return }
+                records = reminders.map { reminder in
+                    let dueComponents = reminder.dueDateComponents.map(Self.normalizedDueDateComponents)
+                    return IndexedRecord(id: "reminder-\(reminder.calendarItemIdentifier)", source: .reminders, title: reminder.title, body: reminder.notes ?? "", author: reminder.calendar?.title, participants: [], timestamp: dueComponents.flatMap { Calendar.current.date(from: $0) } ?? .distantPast, url: nil, threadID: nil)
                 }
                 continuation.resume()
             }
         }
         return records
+    }
+
+    static func normalizedDueDateComponents(_ components: DateComponents) -> DateComponents {
+        // A date-only reminder carries no explicit era; Calendar.date(from:)
+        // needs one to build a real date instead of returning nil.
+        var dated = components
+        if dated.era == nil { dated.era = 1 }
+        return dated
     }
 
     private static func permission(for status: EKAuthorizationStatus) -> SourcePermission {
@@ -99,5 +110,20 @@ final class RemindersSourceAdapter: SourceAdapter, @unchecked Sendable {
         case .writeOnly: .denied
         @unknown default: .unavailable
         }
+    }
+}
+
+/// EventKit completion handlers may deliver more than once. This gate makes
+/// one-shot checked continuations safe under that documented behavior.
+final class SingleDeliveryGate<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hasDelivered = false
+
+    func deliver(_ value: Value) -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !hasDelivered else { return nil }
+        hasDelivered = true
+        return value
     }
 }

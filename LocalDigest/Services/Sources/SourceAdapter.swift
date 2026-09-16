@@ -7,6 +7,7 @@ protocol SourceAdapter: Sendable {
     func requestAccess() async -> SourceStatus
     func fetchRecords() async throws -> [IndexedRecord]
     func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?) async throws -> SourceFetchBatch
+    func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?, progress: @escaping @Sendable (String) -> Void) async throws -> SourceFetchBatch
 }
 
 enum IndexRefreshMode: String, Codable, Sendable {
@@ -41,6 +42,10 @@ extension SourceAdapter {
 
     func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?) async throws -> SourceFetchBatch {
         SourceFetchBatch(records: try await fetchRecords(), nextCursor: nil, isCompleteSnapshot: true)
+    }
+
+    func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?, progress: @escaping @Sendable (String) -> Void) async throws -> SourceFetchBatch {
+        try await fetchRecords(mode: mode, cursor: cursor)
     }
 }
 

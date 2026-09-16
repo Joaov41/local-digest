@@ -19,7 +19,7 @@ struct AskView: View {
                 GlassEffectContainer(spacing: 16) {
                     VStack(alignment: .leading, spacing: 16) {
                         HStack {
-                            Label("Ask Local Digest", systemImage: "sparkles")
+                            Label(store.composerTitle, systemImage: "sparkles")
                                 .font(.headline)
                             Spacer()
                             ProviderBadge(provider: store.provider)
@@ -32,10 +32,10 @@ struct AskView: View {
                             .help("Start a new conversation (Command-N)")
                             .disabled(store.isAnswering)
                         }
-                        TextField("What did Rui tell me last night? Summarize our conversation.", text: $store.question, axis: .vertical)
+                        TextField(store.composerPlaceholder, text: $store.question, axis: .vertical)
                             .textFieldStyle(.plain)
                             .font(.title3)
-                            .lineLimit(3...6)
+                            .lineLimit(2...5)
                             .onSubmit { Task { await store.ask() } }
                         HStack {
                             Text("Only retrieved evidence is sent to the selected Apple model.")
@@ -43,7 +43,7 @@ struct AskView: View {
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Button { Task { await store.ask() } } label: {
-                                Label(store.isAnswering ? "Working" : "Ask", systemImage: store.isAnswering ? "ellipsis" : "arrow.up")
+                                Label(store.isAnswering ? "Working" : store.composerSubmitTitle, systemImage: store.isAnswering ? "ellipsis" : "arrow.up")
                             }
                             .buttonStyle(.glassProminent)
                             .disabled(store.isAnswering || store.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -54,6 +54,11 @@ struct AskView: View {
                 }
 
                 if let error = store.errorMessage { ErrorBanner(message: error) }
+                if store.isDrafting {
+                    Label("Drafting your reply…", systemImage: "paperplane")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 if !conversationHistory.isEmpty {
                     ConversationHistoryView(turns: conversationHistory)
                 }
@@ -139,6 +144,20 @@ struct AnswerResult: View {
                 .font(.body)
                 .textSelection(.enabled)
                 .frame(maxWidth: 700, alignment: .leading)
+            if store.canGoDeeper {
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await store.goDeeper() }
+                    } label: {
+                        Label("Go deeper", systemImage: "arrow.down.forward")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Text("Follow-ups remember the person, dates, and sources of this answer.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
             if !store.hits.isEmpty {
                 Divider()
                 Text("Sources")
@@ -157,6 +176,7 @@ struct AnswerResult: View {
 }
 
 struct EvidenceInspector: View {
+    @EnvironmentObject private var store: AppStore
     let hit: SearchHit?
 
     var body: some View {
@@ -195,6 +215,15 @@ struct EvidenceInspector: View {
                         Text(hit.record.body)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                        if hit.record.source == .mail || hit.record.source == .messages {
+                            Button {
+                                Task { await store.requestReplyDraft(for: hit) }
+                            } label: {
+                                Label("Draft reply", systemImage: "paperplane")
+                            }
+                            .controlSize(.small)
+                            .disabled(store.isDrafting || store.isAnswering)
+                        }
                         Text("Retrieved evidence is shown read-only.")
                             .font(.caption)
                             .foregroundStyle(.secondary)

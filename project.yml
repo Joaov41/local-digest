@@ -27,11 +27,11 @@ targets:
         INFOPLIST_FILE: LocalDigest/Support/Info.plist
         CODE_SIGN_ENTITLEMENTS: LocalDigest.entitlements
         SWIFT_STRICT_CONCURRENCY: targeted
-    frameworks:
-      - Contacts.framework
-      - EventKit.framework
-      - FoundationModels.framework
-      - Security.framework
+    dependencies:
+      - sdk: Contacts.framework
+      - sdk: EventKit.framework
+      - sdk: FoundationModels.framework
+      - sdk: Security.framework
   LocalDigestTests:
     type: bundle.unit-test
     platform: macOS

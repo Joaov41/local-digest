@@ -12,6 +12,15 @@ struct RootView: View {
         .navigationSplitViewStyle(.balanced)
         .searchable(text: $store.searchText, placement: .toolbar, prompt: "Search your sources")
         .onSubmit(of: .search) { Task { await store.performSearch() } }
+        .onChange(of: store.searchText) { _, newValue in
+            if newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !store.hits.isEmpty {
+                store.clearSearch()
+            }
+        }
+        .sheet(item: $store.pendingDraft) { draft in
+            DraftReviewSheet(draft: draft)
+                .environmentObject(store)
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
