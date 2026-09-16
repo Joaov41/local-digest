@@ -1124,6 +1124,125 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertEqual(singular.requestedResultCount, 1)
     }
 
+    func testDeterministicPlannerFindsPeopleAnywhereInQuestion() {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "rui", displayName: "Rui Costa", aliases: ["Rui"], handles: ["+351911000001", "rui.costa@example.test"]),
+                ContactIdentity(id: "ana", displayName: "Ana Silva", aliases: ["Ana"], handles: []),
+                ContactIdentity(id: "miguel", displayName: "Miguel Santos", aliases: ["Miguel"], handles: []),
+                ContactIdentity(id: "sofia", displayName: "Sofia Martins", aliases: ["Sofia"], handles: []),
+                ContactIdentity(id: "joao", displayName: "João Pereira", aliases: ["João", "Joao"], handles: [])
+            ])
+        )
+        let cases: [(String, String, SourceKind)] = [
+            ("did I get an email from Ana this week", "Ana Silva", .mail),
+            ("what events do I have with Miguel next week", "Miguel Santos", .calendar),
+            ("what's Rui's phone number", "Rui Costa", .contacts),
+            ("ana's email address", "Ana Silva", .contacts),
+            ("who is Sofia Martins", "Sofia Martins", .contacts),
+            ("has miguel sent me anything about the car", "Miguel Santos", .mail)
+        ]
+        for (question, person, source) in cases {
+            let plan = planner.plan(question, referenceDate: reference)
+            XCTAssertEqual(plan.constraints.person, person, question)
+            XCTAssertTrue(plan.constraints.sources.contains(source), question)
+        }
+        XCTAssertNil(planner.plan("emails about received packages").constraints.person)
+    }
+
+    func testDeterministicPlannerInfersVerbalSourcesAndKeepsTopics() {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "rui", displayName: "Rui Costa", aliases: ["Rui"], handles: []),
+                ContactIdentity(id: "ana", displayName: "Ana Silva", aliases: ["Ana"], handles: []),
+                ContactIdentity(id: "sofia", displayName: "Sofia Martins", aliases: ["Sofia"], handles: [])
+            ])
+        )
+
+        let meeting = planner.plan("when do I meet Ana", referenceDate: reference)
+        XCTAssertEqual(meeting.constraints.sources, [.calendar])
+        XCTAssertEqual(meeting.constraints.person, "Ana Silva")
+
+        let needed = planner.plan("what do I need to do today", referenceDate: reference)
+        XCTAssertEqual(needed.constraints.sources, [.reminders])
+        XCTAssertNotNil(needed.constraints.startDate)
+
+        let buy = planner.plan("remind me what I have to buy", referenceDate: reference)
+        XCTAssertEqual(buy.constraints.sources, [.reminders])
+        XCTAssertTrue(buy.keywords.contains("buy"))
+
+        let due = planner.plan("what reminders are due tomorrow", referenceDate: reference)
+        XCTAssertEqual(due.constraints.sources, [.reminders])
+        XCTAssertFalse(due.keywords.contains("due"))
+
+        let trip = planner.plan("what did I write about the trip", referenceDate: reference)
+        XCTAssertEqual(trip.constraints.sources, [.notes])
+        XCTAssertEqual(trip.keywords, ["trip"])
+
+        let sofia = planner.plan("who is Sofia Martins", referenceDate: reference)
+        XCTAssertEqual(sofia.constraints.sources, [.contacts])
+        XCTAssertEqual(sofia.constraints.person, "Sofia Martins")
+
+        let phone = planner.plan("what's Rui's phone number", referenceDate: reference)
+        XCTAssertEqual(phone.constraints.sources, [.contacts])
+        XCTAssertEqual(phone.constraints.person, "Rui Costa")
+    }
+
+    func testDeterministicPlannerExpandedStopwordsPreserveTopicWords() {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let planner = QueryPlanner(dateParser: DatePhraseParser(now: { reference }))
+
+        XCTAssertEqual(
+            planner.plan("when is the dentist appointment", referenceDate: reference).keywords,
+            ["dentist"]
+        )
+        XCTAssertEqual(
+            planner.plan("everything about lisbon", referenceDate: reference).keywords,
+            ["lisbon"]
+        )
+        let group = planner.plan("what did Ana and Miguel talk about in the group", referenceDate: reference)
+        XCTAssertTrue(group.keywords.contains("group"))
+        XCTAssertFalse(group.keywords.contains("talk"))
+    }
+
+    func testDeterministicPlannerHandlesSingularTrailingRecency() {
+        let planner = QueryPlanner()
+
+        for question in ["what is the last message I got", "the last email I received"] {
+            let plan = planner.plan(question)
+            XCTAssertEqual(plan.ordering, .newestFirst, question)
+            XCTAssertEqual(plan.requestedResultCount, 1, question)
+        }
+        XCTAssertEqual(planner.plan("latest email").requestedResultCount, 1)
+    }
+
+    func testDatePhraseParserUnderstandsWeekendsAndTonight() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let parser = DatePhraseParser(calendar: calendar, now: { reference })
+        let saturday = ISO8601DateFormatter().date(from: "2026-09-19T00:00:00Z")!
+        let monday = ISO8601DateFormatter().date(from: "2026-09-21T00:00:00Z")!
+        XCTAssertEqual(parser.parse("plans for the weekend", referenceDate: reference)?.start, saturday)
+        XCTAssertEqual(parser.parse("plans for the weekend", referenceDate: reference)?.end, monday)
+        XCTAssertEqual(
+            parser.parse("last weekend", referenceDate: reference)?.start,
+            ISO8601DateFormatter().date(from: "2026-09-12T00:00:00Z")
+        )
+        XCTAssertEqual(
+            parser.parse("tonight", referenceDate: reference)?.start,
+            ISO8601DateFormatter().date(from: "2026-09-16T18:00:00Z")
+        )
+        XCTAssertEqual(
+            parser.parse("tonight", referenceDate: reference)?.end,
+            ISO8601DateFormatter().date(from: "2026-09-17T06:00:00Z")
+        )
+    }
+
     func testKnownContactBeforeRecencyResolvesTypoPossessiveAndSourceForms() {
         let planner = QueryPlanner(identityResolver: IdentityResolver(identities: [
             ContactIdentity(id: "cachinhos-a", displayName: "Cachinhos", aliases: ["Cachi"], handles: ["+351 910 000 001"]),
