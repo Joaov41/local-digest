@@ -530,14 +530,20 @@ struct QueryPlanner: Sendable {
         guard sourceIndex > 0 else { return [] }
         let futureSource = source.map { $0 == .calendar || $0 == .reminders } ?? (tokens.contains("calendar") || tokens.contains("event") || tokens.contains("events") || tokens.contains("reminder") || tokens.contains("reminders"))
         let recognized: Set<String> = ["latest", "latests", "lastest", "newest", "recent", "most", "last", "upcoming", "next"]
+        let qualifierTokens: Set<String> = ["received", "incoming", "unread", "new"]
         var result = Set<Int>()
         for index in 0..<sourceIndex {
             guard let canonical = canonicalRecencyToken(tokens[index]) else { continue }
             if ["upcoming", "next"].contains(canonical), !futureSource { continue }
             if canonical == "last", count == nil { continue }
             let between = tokens[(index + 1)..<sourceIndex]
-            guard between.allSatisfy({ Int($0) != nil || recognized.contains($0) }) else { continue }
+            guard between.allSatisfy({
+                Int($0) != nil || recognized.contains($0) || qualifierTokens.contains($0)
+            }) else { continue }
             result.insert(index)
+            for (offset, token) in between.enumerated() where qualifierTokens.contains(token) {
+                result.insert(index + 1 + offset)
+            }
             // "most" is part of the "most recent" operator, but is not a
             // recency operator on its own and therefore needs to be removed
             // from FTS alongside the adjacent "recent" token.

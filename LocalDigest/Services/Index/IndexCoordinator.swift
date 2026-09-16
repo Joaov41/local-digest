@@ -79,7 +79,13 @@ actor IndexCoordinator {
                     // Writes remain serialized by SQLiteIndex's actor.
                     progress(adapter.source, 0, -1)
                     do {
-                        let batch = try await adapter.fetchRecords(mode: mode, cursor: cursor) { message in
+                        let knownIDs: Set<String>
+                        if mode == .incremental, cursor != nil {
+                            knownIDs = (try? await self.index.recordIDs(source: adapter.source)) ?? []
+                        } else {
+                            knownIDs = []
+                        }
+                        let batch = try await adapter.fetchRecords(mode: mode, cursor: cursor, knownRecordIDs: knownIDs) { message in
                             detail(adapter.source, message)
                         }
                         guard !Task.isCancelled else { return .cancelled(adapter.source) }
