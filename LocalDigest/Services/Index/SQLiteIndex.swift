@@ -148,6 +148,10 @@ actor SQLiteIndex {
         try await reader.count(source: source)
     }
 
+    nonisolated func recordIDs(source: SourceKind) async throws -> Set<String> {
+        try await reader.recordIDs(source: source)
+    }
+
     nonisolated func conversation(threadID: String, limit: Int = 80) async throws -> [SearchHit] {
         try await reader.conversation(threadID: threadID, limit: limit)
     }
@@ -383,6 +387,20 @@ private actor SQLiteIndexReader {
         bind(source.rawValue, to: statement, index: 1)
         guard sqlite3_step(statement) == SQLITE_ROW else { throw currentError() }
         return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    func recordIDs(source: SourceKind) throws -> Set<String> {
+        guard let database = try openIfAvailable() else { return [] }
+        let sql = "SELECT id FROM records WHERE source = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw currentError() }
+        defer { sqlite3_finalize(statement) }
+        bind(source.rawValue, to: statement, index: 1)
+        var result = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) {
+            result.insert(String(cString: value))
+        }
+        return result
     }
 
     /// Full chronological thread content for reply drafting. This is a

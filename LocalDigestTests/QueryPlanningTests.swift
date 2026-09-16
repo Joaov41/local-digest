@@ -220,6 +220,25 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertEqual(hits.map(\.record.id), ["mail-persisted"])
     }
 
+    func testSQLiteRecordIDsReturnsRecordsAfterReplace() async throws {
+        let databaseURL = FileManager.default.temporaryDirectory.appendingPathComponent("local-digest-record-ids-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: databaseURL)
+            try? FileManager.default.removeItem(atPath: databaseURL.path + "-shm")
+            try? FileManager.default.removeItem(atPath: databaseURL.path + "-wal")
+        }
+
+        let index = SQLiteIndex(databaseURL: databaseURL)
+        let records = [
+            IndexedRecord(id: "mail-1", source: .mail, title: "One", body: "Body", author: nil, participants: [], timestamp: Date(), url: nil, threadID: nil),
+            IndexedRecord(id: "mail-2", source: .mail, title: "Two", body: "Body", author: nil, participants: [], timestamp: Date(), url: nil, threadID: nil)
+        ]
+        try await index.replace(source: .mail, with: records)
+
+        let recordIDs = try await index.recordIDs(source: .mail)
+        XCTAssertEqual(recordIDs, Set(["mail-1", "mail-2"]))
+    }
+
     func testMailAndNotesAutomationTargetsAreAppAttributedWithoutProbingTCC() {
         XCTAssertEqual(AppleScriptRunner.automationBundleIdentifier(for: .mail), "com.apple.mail")
         XCTAssertEqual(AppleScriptRunner.automationBundleIdentifier(for: .notes), "com.apple.Notes")
@@ -994,6 +1013,35 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertEqual(MailSourceAdapter.lookbackSeconds(for: older, now: now), 27 * 86_400)
     }
 
+    func testMailIncrementalReferencesScriptAvoidsContentFields() {
+        let script = MailSourceAdapter.incrementalReferencesScript(accountIndex: 2, mailboxIndex: 7, lookbackSeconds: 604_800)
+        XCTAssertTrue(script.contains("date received is greater than or equal to cutoffDate"))
+        XCTAssertFalse(script.contains("content of m"))
+        XCTAssertFalse(script.contains("subject of m"))
+    }
+
+    func testMailIncrementalReferencesParseIDsAndDates() {
+        let value = "123\u{1F}2026-09-16 10:00:00\u{1E}124\u{1F}2026-09-15 09:00:00\u{1E}"
+        let references = MailSourceAdapter.parseReferences(value)
+        XCTAssertEqual(references.map(\.id), ["mail-123", "mail-124"])
+        XCTAssertTrue(references.allSatisfy { $0.timestamp != .distantPast })
+    }
+
+    func testMailIncrementalCursorUsesReferencesAndPreservesPriorWithoutReferences() {
+        let prior = SourceCursor(watermark: Date(timeIntervalSince1970: 1_000), rawWatermark: nil, rowID: nil, stableID: "mail-1")
+        let newerReference = Date(timeIntervalSince1970: 2_000)
+        let advanced = MailSourceAdapter.nextCursor(
+            recordTimestamps: [],
+            referenceTimestamps: [newerReference],
+            prior: prior
+        )
+        XCTAssertEqual(advanced?.watermark, newerReference)
+        XCTAssertEqual(
+            MailSourceAdapter.nextCursor(recordTimestamps: [], referenceTimestamps: [], prior: prior),
+            prior
+        )
+    }
+
     func testMailIncrementalMergePreservesReceivedDatesForRelativeDateQueries() async throws {
         let databaseURL = FileManager.default.temporaryDirectory.appendingPathComponent("local-digest-mail-dates-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: databaseURL); try? FileManager.default.removeItem(atPath: databaseURL.path + "-shm"); try? FileManager.default.removeItem(atPath: databaseURL.path + "-wal") }
@@ -1049,6 +1097,31 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertEqual(latestPluralTopic.ordering, .newestFirst)
         XCTAssertEqual(latestPluralTopic.requestedResultCount, 5)
         XCTAssertTrue(latestPluralTopic.keywords.contains("project"))
+    }
+
+    func testMailRecencyQualifiersAreGrammarOnly() {
+        let planner = QueryPlanner()
+
+        let latestReceived = planner.plan("what was my latest received email")
+        XCTAssertEqual(latestReceived.ordering, .newestFirst)
+        XCTAssertEqual(latestReceived.requestedResultCount, 1)
+        XCTAssertFalse(latestReceived.keywords.contains("latest"))
+        XCTAssertFalse(latestReceived.keywords.contains("received"))
+
+        let unread = planner.plan("show my 3 most recent unread emails")
+        XCTAssertEqual(unread.ordering, .newestFirst)
+        XCTAssertEqual(unread.requestedResultCount, 3)
+        XCTAssertFalse(unread.keywords.contains("most"))
+        XCTAssertFalse(unread.keywords.contains("recent"))
+        XCTAssertFalse(unread.keywords.contains("unread"))
+
+        let receivedTopic = planner.plan("emails about received packages")
+        XCTAssertEqual(receivedTopic.ordering, .relevance)
+        XCTAssertTrue(receivedTopic.keywords.contains("received"))
+
+        let singular = planner.plan("latest email")
+        XCTAssertEqual(singular.ordering, .newestFirst)
+        XCTAssertEqual(singular.requestedResultCount, 1)
     }
 
     func testKnownContactBeforeRecencyResolvesTypoPossessiveAndSourceForms() {
@@ -1861,6 +1934,7 @@ final class QueryPlanningTests: XCTestCase {
         }
 
         let initial = IndexedRecord(id: "message-initial", source: .messages, title: "Rui", body: "initial committed", author: "Rui", participants: [], timestamp: Date(timeIntervalSince1970: 1_700_000_000), url: nil, threadID: "chat")
+        let initialSecond = IndexedRecord(id: "message-initial-second", source: .messages, title: "Rui", body: "second committed", author: "Rui", participants: [], timestamp: Date(timeIntervalSince1970: 1_700_000_010), url: nil, threadID: "chat")
         let newRecord = IndexedRecord(id: "message-new", source: .messages, title: "Rui", body: "new today", author: "Rui", participants: [], timestamp: Date(timeIntervalSince1970: 1_700_000_100), url: nil, threadID: "chat")
         let rebuilt = IndexedRecord(id: "message-rebuilt", source: .messages, title: "Rui", body: "reconciled full rebuild", author: "Rui", participants: [], timestamp: Date(timeIntervalSince1970: 1_700_000_200), url: nil, threadID: "chat")
         let initialCursor = SourceCursor(watermark: initial.timestamp, rawWatermark: 1_000, rowID: 10, stableID: initial.id)
@@ -1870,13 +1944,13 @@ final class QueryPlanningTests: XCTestCase {
 
         let firstCoordinator = IndexCoordinator(
             index: index,
-            adapters: [CursorFixtureAdapter(source: .messages, initial: [initial], delta: [newRecord], rebuild: [rebuilt], initialCursor: initialCursor, nextCursor: nextCursor, calls: calls)]
+            adapters: [CursorFixtureAdapter(source: .messages, initial: [initial, initialSecond], delta: [newRecord], rebuild: [rebuilt], initialCursor: initialCursor, nextCursor: nextCursor, calls: calls)]
         )
         _ = await firstCoordinator.indexAll { _, _, _ in }
 
         let secondCoordinator = IndexCoordinator(
             index: index,
-            adapters: [CursorFixtureAdapter(source: .messages, initial: [initial], delta: [newRecord], rebuild: [rebuilt], initialCursor: initialCursor, nextCursor: nextCursor, calls: calls)]
+            adapters: [CursorFixtureAdapter(source: .messages, initial: [initial, initialSecond], delta: [newRecord], rebuild: [rebuilt], initialCursor: initialCursor, nextCursor: nextCursor, calls: calls)]
         )
         _ = await secondCoordinator.indexAll { _, _, _ in }
 
@@ -1884,6 +1958,9 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertEqual(recordedCursors.count, 2)
         XCTAssertNil(recordedCursors[0])
         XCTAssertEqual(recordedCursors[1], initialCursor)
+        let recordedKnownIDs = await calls.knownValues()
+        XCTAssertEqual(recordedKnownIDs[0], [])
+        XCTAssertEqual(recordedKnownIDs[1], Set([initial.id, initialSecond.id]))
         let initialHits = try await index.search(plan: messagePlan(keywords: ["initial"]))
         XCTAssertEqual(initialHits.map(\.record.id), ["message-initial"])
         let newHits = try await index.search(plan: messagePlan(keywords: ["today"]))
@@ -1891,7 +1968,7 @@ final class QueryPlanningTests: XCTestCase {
 
         let failingCoordinator = IndexCoordinator(
             index: index,
-            adapters: [CursorFixtureAdapter(source: .messages, initial: [initial], delta: [newRecord], rebuild: [rebuilt], initialCursor: initialCursor, nextCursor: nextCursor, calls: calls, shouldFail: true)]
+            adapters: [CursorFixtureAdapter(source: .messages, initial: [initial, initialSecond], delta: [newRecord], rebuild: [rebuilt], initialCursor: initialCursor, nextCursor: nextCursor, calls: calls, shouldFail: true)]
         )
         _ = await failingCoordinator.indexAll { _, _, _ in }
         let preservedHits = try await index.search(plan: messagePlan(keywords: ["today"]))
@@ -1901,7 +1978,7 @@ final class QueryPlanningTests: XCTestCase {
 
         let fullRebuildCoordinator = IndexCoordinator(
             index: index,
-            adapters: [CursorFixtureAdapter(source: .messages, initial: [initial], delta: [newRecord], rebuild: [rebuilt], initialCursor: initialCursor, nextCursor: nextCursor, calls: calls)]
+            adapters: [CursorFixtureAdapter(source: .messages, initial: [initial, initialSecond], delta: [newRecord], rebuild: [rebuilt], initialCursor: initialCursor, nextCursor: nextCursor, calls: calls)]
         )
         _ = await fullRebuildCoordinator.indexAll(mode: .fullRebuild) { _, _, _ in }
         let removedHits = try await index.search(plan: messagePlan(keywords: ["initial"]))
@@ -2619,7 +2696,11 @@ private struct CursorFixtureAdapter: SourceAdapter {
     }
 
     func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?) async throws -> SourceFetchBatch {
-        await calls.record(cursor)
+        try await fetchRecords(mode: mode, cursor: cursor, knownRecordIDs: [], progress: { _ in })
+    }
+
+    func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?, knownRecordIDs: Set<String>, progress: @escaping @Sendable (String) -> Void) async throws -> SourceFetchBatch {
+        await calls.record(cursor, knownRecordIDs: knownRecordIDs)
         if shouldFail {
             throw SourceAdapterError.unavailable(source, "Fixture incremental fetch failed")
         }
@@ -2678,13 +2759,19 @@ private actor FetchCounter {
 
 private actor CursorFixtureCalls {
     private var cursors: [SourceCursor?] = []
+    private var knownIDs: [Set<String>] = []
 
-    func record(_ cursor: SourceCursor?) {
+    func record(_ cursor: SourceCursor?, knownRecordIDs: Set<String>) {
         cursors.append(cursor)
+        knownIDs.append(knownRecordIDs)
     }
 
     func values() -> [SourceCursor?] {
         cursors
+    }
+
+    func knownValues() -> [Set<String>] {
+        knownIDs
     }
 }
 

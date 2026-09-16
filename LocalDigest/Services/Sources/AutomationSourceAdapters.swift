@@ -5,7 +5,7 @@ import AppKit
 final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
     let source: SourceKind = .mail
     private let state = PermissionState(source: .mail)
-    let refreshCapability: SourceRefreshCapability = .incremental("Received-date cursor with a seven-day overlap; older edits require Full Rebuild.")
+    let refreshCapability: SourceRefreshCapability = .incremental("Received-date cursor with a seven-day overlap; unchanged mailboxes are skipped; older edits require Full Rebuild.")
 
     func status() async -> SourceStatus {
         SourceStatus(source: source, permission: await state.permission, indexedCount: 0, isIndexing: false, message: await state.message)
@@ -37,21 +37,36 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
     }
 
     func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?, progress: @escaping @Sendable (String) -> Void) async throws -> SourceFetchBatch {
+        try await fetchRecords(mode: mode, cursor: cursor, knownRecordIDs: [], progress: progress)
+    }
+
+    func fetchRecords(mode: IndexRefreshMode, cursor: SourceCursor?, knownRecordIDs: Set<String>, progress: @escaping @Sendable (String) -> Void) async throws -> SourceFetchBatch {
         guard await status().permission == .authorized else { throw SourceAdapterError.permissionDenied(source, "Allow Mail automation in System Settings.") }
         let mailboxes = mode == .incremental && cursor != nil
             ? try await Self.mailboxReferences()
             : try await Self.mailboxes()
         var records: [IndexedRecord] = []
+        var referenceTimestamps: [Date] = []
         if mode == .incremental, let cursor {
             let lookback = Self.lookbackSeconds(for: cursor)
             for (offset, mailbox) in mailboxes.enumerated() {
                 progress(Self.mailboxProgressLabel(index: offset + 1, total: mailboxes.count))
-                let script = Self.incrementalRecordsScript(
+                let referencesScript = Self.incrementalReferencesScript(
                     accountIndex: mailbox.accountIndex,
                     mailboxIndex: mailbox.mailboxIndex,
                     lookbackSeconds: lookback
                 )
-                records.append(contentsOf: Self.parse(try await AppleScriptRunner.run(script, source: source)))
+                let references = Self.parseReferences(try await AppleScriptRunner.run(referencesScript, source: source))
+                referenceTimestamps.append(contentsOf: references.map(\.timestamp))
+                let newIDs = references.filter { !knownRecordIDs.contains($0.id) }
+                if knownRecordIDs.isEmpty || !newIDs.isEmpty {
+                    let script = Self.incrementalRecordsScript(
+                        accountIndex: mailbox.accountIndex,
+                        mailboxIndex: mailbox.mailboxIndex,
+                        lookbackSeconds: lookback
+                    )
+                    records.append(contentsOf: Self.parse(try await AppleScriptRunner.run(script, source: source)))
+                }
             }
         } else {
             for mailbox in mailboxes {
@@ -61,7 +76,7 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
                 }
             }
         }
-        let nextCursor = Self.nextCursor(records, prior: cursor)
+        let nextCursor = Self.nextCursor(records, referenceTimestamps: referenceTimestamps, prior: cursor)
         return SourceFetchBatch(
             records: records,
             nextCursor: nextCursor,
@@ -234,6 +249,35 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
         """
     }
 
+    static func incrementalReferencesScript(accountIndex: Int, mailboxIndex: Int, lookbackSeconds: Int) -> String {
+        """
+        on pad(n)
+            if n < 10 then return "0" & (n as text)
+            return n as text
+        end pad
+
+        on isoDate(d)
+            set t to time of d
+            return (year of d as text) & "-" & my pad(month of d as integer) & "-" & my pad(day of d) & " " & my pad(t div 3600) & ":" & my pad((t mod 3600) div 60) & ":" & my pad(t mod 60)
+        end isoDate
+
+        tell application "Mail"
+            set output to ""
+            set fieldSeparator to ASCII character 31
+            set recordSeparator to ASCII character 30
+            set cutoffDate to (current date) - \(max(0, lookbackSeconds))
+            set targetAccount to account \(accountIndex)
+            set targetMailbox to mailbox \(mailboxIndex) of targetAccount
+            repeat with m in (messages of targetMailbox whose date received is greater than or equal to cutoffDate)
+                try
+                    set output to output & (id of m as text) & fieldSeparator & (my isoDate(date received of m)) & recordSeparator
+                end try
+            end repeat
+            return output
+        end tell
+        """
+    }
+
     static func lookbackSeconds(for cursor: SourceCursor, now: Date = Date()) -> Int {
         guard let watermark = cursor.watermark else { return 7 * 24 * 60 * 60 }
         let minimum = 7 * 24 * 60 * 60
@@ -251,6 +295,14 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
         }
     }
 
+    static func parseReferences(_ value: String) -> [(id: String, timestamp: Date)] {
+        value.split(separator: "\u{1E}", omittingEmptySubsequences: true).compactMap { record in
+            let fields = record.split(separator: "\u{1F}", maxSplits: 1).map(String.init)
+            guard fields.count == 2, let timestamp = DateParser.parse(fields[1]) else { return nil }
+            return (id: "mail-\(fields[0])", timestamp: timestamp)
+        }
+    }
+
     static func mailThreadKey(from subject: String) -> String {
         let normalized = subject.replacingOccurrences(of: #"^(?i:(re|fw|fwd):\s*)+"#, with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -258,10 +310,24 @@ final class MailSourceAdapter: SourceAdapter, @unchecked Sendable {
         return "mail-thread-" + normalized
     }
 
-    private static func nextCursor(_ records: [IndexedRecord], prior: SourceCursor?) -> SourceCursor? {
-        let dated = records.filter { $0.timestamp != .distantPast }
-        guard let newest = dated.max(by: { $0.timestamp < $1.timestamp }) else { return prior }
-        return SourceCursor(watermark: newest.timestamp, rawWatermark: nil, rowID: nil, stableID: newest.id)
+    static func nextCursor(recordTimestamps: [Date], referenceTimestamps: [Date], prior: SourceCursor?) -> SourceCursor? {
+        let timestamps = (recordTimestamps + referenceTimestamps).filter { $0 != .distantPast }
+        guard let newest = timestamps.max() else { return prior }
+        return SourceCursor(watermark: newest, rawWatermark: nil, rowID: nil, stableID: prior?.stableID)
+    }
+
+    static func nextCursor(_ records: [IndexedRecord], referenceTimestamps: [Date] = [], prior: SourceCursor?) -> SourceCursor? {
+        let recordTimestamps = records.map(\.timestamp)
+        guard let cursor = nextCursor(recordTimestamps: recordTimestamps, referenceTimestamps: referenceTimestamps, prior: prior) else { return prior }
+        let newestRecord = records
+            .filter { $0.timestamp != .distantPast }
+            .max(by: { $0.timestamp < $1.timestamp })
+        return SourceCursor(
+            watermark: cursor.watermark,
+            rawWatermark: cursor.rawWatermark,
+            rowID: cursor.rowID,
+            stableID: newestRecord?.id ?? prior?.stableID
+        )
     }
 }
 
