@@ -256,9 +256,10 @@ struct QueryPlanner: Sendable {
     }
 
     /// Applies a model-supplied language interpretation to the deterministic
-    /// plan. Deterministic source/date/person evidence always wins. The model
-    /// can fill gaps, but cannot introduce handles, timestamps, SQL, or a
-    /// source outside SearchScope.
+    /// plan. The model supplies the primary language interpretation while
+    /// deterministic planning validates scope, identities, and dates and
+    /// provides safe fallbacks. The model cannot introduce handles,
+    /// timestamps, SQL, or a source outside SearchScope.
     func plan(
         _ question: String,
         scope: SearchScope = SearchScope(),
@@ -269,10 +270,9 @@ struct QueryPlanner: Sendable {
     ) -> QueryPlan {
         let base = plan(question, scope: scope, context: context, referenceDate: referenceDate, surface: surface)
         let reference = referenceDate ?? Date()
-        let deterministicDate = dateParser.parse(question, referenceDate: reference)
-        let modelDate = deterministicDate == nil
-            ? structuredIntent.timeframePhrase.flatMap { dateParser.parse($0, referenceDate: reference) }
-            : nil
+        let modelDate = structuredIntent.timeframePhrase.flatMap {
+            dateParser.parse($0, referenceDate: reference)
+        }
 
         var constraints = base.constraints
         let sourceIntent = explicitSource(in: question)
@@ -291,7 +291,7 @@ struct QueryPlanner: Sendable {
         }
 
         var ambiguity = base.ambiguity
-        var keywords = base.keywords
+        var ambiguousPersonTokens: Set<String> = []
         let deterministicPersonPhrase = extractPersonPhrase(from: question, sourceIntent: sourceIntent).flatMap(Self.withoutPronouns)
         // A locally resolved person is authoritative. An unresolved rule
         // phrase is only a candidate and may be repaired by a copied model
@@ -312,8 +312,7 @@ struct QueryPlanner: Sendable {
                 constraints.person = nil
                 constraints.personTerms = []
                 ambiguity = orderedUnique(resolved.map(\.displayName))
-                let personTokens = Set(IdentityResolver.tokens(cleanPhrase))
-                keywords.removeAll { personTokens.contains($0) }
+                ambiguousPersonTokens = Set(IdentityResolver.tokens(cleanPhrase))
                 hasUnresolvedPersonPhrase = true
             } else {
                 // An unresolved model phrase is an explicit new-turn person
@@ -328,46 +327,52 @@ struct QueryPlanner: Sendable {
         let modelPersonTokens = Set(structuredIntent.personPhrase.flatMap(IdentityResolver.tokens) ?? [])
         let modelSourceTokens = Set((structuredIntent.sources ?? []).flatMap { sourceWords(for: $0) })
         let modelDateTokens = Set(structuredIntent.timeframePhrase.flatMap(IdentityResolver.tokens) ?? [])
-        let structuralTokens: Set<String> = [
-            "catch", "catchup", "caught", "up", "anything", "new", "latest", "newest", "recent", "recently",
-            "last", "few", "conversation", "conversations", "sent", "send", "show", "list", "summarize",
-            "summary", "what", "has", "have", "from", "with", "for", "me", "on", "of", "this", "the",
-            "please", "tell", "did", "say", "said", "get", "give", "find", "messages", "message", "emails",
-            "email", "mail", "notes", "note", "calendar", "event", "events", "reminders", "reminder", "contacts",
-            "contact", "today", "yesterday", "tomorrow", "week", "month", "sent"
-        ]
-        let removedTokens = modelPersonTokens.union(modelSourceTokens).union(modelDateTokens).union(structuralTokens)
-        keywords = keywords.filter { !removedTokens.contains($0) }
+        let removedModelTokens = modelPersonTokens.union(modelSourceTokens).union(modelDateTokens)
+        let hasModelSignal = structuredIntent.sources != nil
+            || structuredIntent.personPhrase.map { !$0.isEmpty } == true
+            || structuredIntent.timeframePhrase.map { !$0.isEmpty } == true
+            || structuredIntent.ordering != nil
+            || structuredIntent.requestedCount != nil
+        var keywords: [String]
+        if let topic = structuredIntent.topicPhrase, !topic.isEmpty {
+            keywords = IdentityResolver.tokens(topic).filter { token in
+                token.count > 2
+                    && !removedModelTokens.contains(token)
+                    && Int(token) == nil
+            }
+        } else if hasModelSignal {
+            keywords = []
+        } else {
+            keywords = base.keywords.filter { !removedModelTokens.contains($0) }
+        }
         if !hasDeterministicPerson, let phrase = structuredIntent.personPhrase,
            let cleanPhrase = Self.withoutPronouns(phrase),
            !resolvedModelPerson, ambiguity.isEmpty {
             // An unknown model person is still literal language, not an
             // author constraint. Keeping it searchable avoids broadening a
             // free-form request into an unrelated corpus-wide query.
-            keywords.append(contentsOf: IdentityResolver.tokens(cleanPhrase).filter { $0.count > 2 && Int($0) == nil })
-        }
-        if let topic = structuredIntent.topicPhrase {
-            keywords.append(contentsOf: IdentityResolver.tokens(topic).filter { token in
-                token.count > 2 && !removedTokens.contains(token) && Int(token) == nil
+            keywords.append(contentsOf: IdentityResolver.tokens(cleanPhrase).filter {
+                $0.count > 2
+                    && !removedModelTokens.contains($0)
+                    && Int($0) == nil
             })
         }
-        keywords = orderedUnique(keywords)
+        keywords.removeAll { ambiguousPersonTokens.contains($0) }
 
         let currentRecency = recencyRequest(in: question, sourceIntent: sourceIntent)
+        let explicitCount = IdentityResolver.tokens(question).compactMap(Int.init).first
         let hasCurrentOrdering = currentRecency.ordering != .relevance
-        let hasCurrentCount = currentRecency.count != nil
-        let ordering = hasCurrentOrdering
+        let rulesWin = explicitCount != nil && hasCurrentOrdering
+        let ordering = rulesWin
             ? currentRecency.ordering
-            : (structuredIntent.ordering ?? base.ordering)
+            : (structuredIntent.ordering ?? (hasCurrentOrdering ? currentRecency.ordering : nil) ?? base.ordering)
         let requestedCount: Int?
-        if hasCurrentCount {
+        if rulesWin {
             requestedCount = currentRecency.count
-        } else if let modelCount = structuredIntent.requestedCount {
-            requestedCount = modelCount
-        } else if ordering != .relevance {
-            requestedCount = hasCurrentOrdering || structuredIntent.ordering != nil ? 5 : base.requestedResultCount
         } else {
-            requestedCount = base.requestedResultCount
+            requestedCount = structuredIntent.requestedCount
+                ?? currentRecency.count
+                ?? (ordering != .relevance ? 5 : base.requestedResultCount)
         }
 
         let modelSingleSource = structuredIntent.sources?.count == 1
@@ -390,6 +395,15 @@ struct QueryPlanner: Sendable {
             constraints.personTerms = [selectedPerson]
             ambiguity = []
             hasUnresolvedPersonPhrase = false
+        }
+
+        keywords = orderedUnique(keywords)
+        if keywords.isEmpty,
+           ordering == .relevance,
+           constraints.person == nil,
+           constraints.startDate == nil,
+           constraints.sources.isEmpty {
+            keywords = base.keywords
         }
 
         // A unique local identity is the only model-person result that may

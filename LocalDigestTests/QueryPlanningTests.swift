@@ -2023,6 +2023,126 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertTrue(plan.needsConversationExpansion)
     }
 
+    func testModelFirstOrderingWinsWithoutExplicitNumber() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(
+            sources: [.mail],
+            requestedCount: 1,
+            ordering: .newestFirst
+        ))
+        let plan = await HybridQueryPlanner(planner: QueryPlanner(), interpreter: interpreter)
+            .plan("what was my latest received email", referenceDate: reference)
+
+        XCTAssertEqual(plan.ordering, .newestFirst)
+        XCTAssertEqual(plan.requestedResultCount, 1)
+        XCTAssertTrue(plan.keywords.isEmpty)
+        XCTAssertEqual(plan.constraints.sources, [.mail])
+    }
+
+    func testModelTopicReplacesRuleKeywords() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(
+            topicPhrase: "invoice plumber"
+        ))
+        let plan = await HybridQueryPlanner(planner: QueryPlanner(), interpreter: interpreter)
+            .plan(
+                "can you please show me anything about the invoice from the plumber",
+                referenceDate: reference
+            )
+
+        XCTAssertEqual(plan.keywords, ["invoice", "plumber"])
+    }
+
+    func testExplicitNumberKeepsRuleOrdering() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(
+                    id: "rui",
+                    displayName: "Rui Almeida",
+                    aliases: ["Rui"],
+                    handles: ["rui@example.test"]
+                )
+            ])
+        )
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(
+            requestedCount: 2,
+            ordering: .upcomingFirst
+        ))
+        let plan = await HybridQueryPlanner(planner: planner, interpreter: interpreter)
+            .plan(
+                "latest 3 messages from Rui",
+                scope: SearchScope(selectedSources: [.messages]),
+                referenceDate: reference
+            )
+
+        XCTAssertEqual(plan.ordering, .newestFirst)
+        XCTAssertEqual(plan.requestedResultCount, 3)
+    }
+
+    func testModelTimeframeWinsOverRuleDate() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let parser = DatePhraseParser(now: { reference })
+        let expected = parser.parse("today", referenceDate: reference)
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(
+            timeframePhrase: "today"
+        ))
+        let plan = await HybridQueryPlanner(
+            planner: QueryPlanner(dateParser: parser),
+            interpreter: interpreter
+        ).plan(
+            "what came in today from last week's thread",
+            referenceDate: reference
+        )
+
+        XCTAssertEqual(plan.constraints.startDate, expected?.start)
+        XCTAssertEqual(plan.constraints.endDate, expected?.end)
+    }
+
+    func testEmptyModelTopicFallsBackToRuleKeywords() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent())
+        let plan = await HybridQueryPlanner(planner: QueryPlanner(), interpreter: interpreter)
+            .plan("shipment tracking", referenceDate: reference)
+
+        XCTAssertTrue(plan.keywords.contains("shipment"))
+        XCTAssertTrue(plan.keywords.contains("tracking"))
+    }
+
+    func testEmptyModelTopicWithIntentSignalsClearsRuleKeywords() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-08-28T12:00:00Z")!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(
+                    id: "rui",
+                    displayName: "Rui Almeida",
+                    aliases: ["Rui"],
+                    handles: ["rui@example.test"]
+                )
+            ])
+        )
+        let prior = planner.plan("What did Rui tell me this week?", referenceDate: reference)
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(
+            sources: [.messages],
+            personPhrase: "she",
+            requestedCount: 5,
+            ordering: .newestFirst,
+            continuesConversation: true
+        ))
+        let plan = await HybridQueryPlanner(planner: planner, interpreter: interpreter)
+            .plan(
+                "What has she sent recently?",
+                context: prior,
+                referenceDate: reference
+            )
+
+        XCTAssertTrue(plan.keywords.isEmpty)
+        XCTAssertEqual(plan.constraints.person, "Rui Almeida")
+        XCTAssertEqual(plan.ordering, .newestFirst)
+    }
+
     func testHybridPronounFollowUpInheritsPersonButUsesModelOrdering() async {
         let reference = ISO8601DateFormatter().date(from: "2026-08-28T12:00:00Z")!
         let planner = QueryPlanner(
