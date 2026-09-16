@@ -28,6 +28,24 @@ protocol AnswerStreaming: Sendable {
 struct QueryPlanner: Sendable {
     fileprivate let dateParser: DatePhraseParser
     private let identityResolver: IdentityResolver
+    private static let queryStopWords: Set<String> = [
+        "what", "did", "tell", "told", "say", "said", "me", "night", "summarize", "our",
+        "conversation", "the", "about", "with", "and", "from", "my", "contact", "please", "this",
+        "morning", "today", "yesterday", "tomorrow", "week", "message", "messages", "chat", "on", "at",
+        "in", "during", "find", "found", "locate", "show", "list", "a", "an", "for", "it", "is", "are",
+        "was", "were", "do", "does", "can", "you", "of", "to", "be", "there", "any", "where", "which",
+        "mention", "mentions", "contains", "containing", "titled", "called", "named",
+        "he", "she", "they", "him", "her", "them", "his", "hers", "their", "theirs", "that", "those",
+        "go", "dig", "going", "deeper", "more", "elaborate", "expand", "continue", "else",
+        "detail", "details", "context", "info", "catch", "catchup", "caught", "up", "anything",
+        "new", "sent", "recently", "few",
+        "when", "who", "whom", "whose", "how", "why", "get", "got", "gets", "need", "needs", "have",
+        "has", "had", "remind", "happened", "happen", "happens", "miss", "missed", "talk", "talked",
+        "talking", "meet", "met", "write", "wrote", "written", "everything", "all", "some", "something",
+        "give", "gave", "know", "want", "wants", "should", "would", "could", "will", "just", "also",
+        "like", "let", "lets", "see", "check", "look", "due", "its", "i", "im", "ive", "we", "us",
+        "they", "or", "but", "if", "so", "than", "then", "because", "again", "really"
+    ]
 
     init(dateParser: DatePhraseParser = DatePhraseParser(), identityResolver: IdentityResolver = IdentityResolver()) {
         self.dateParser = dateParser
@@ -56,24 +74,6 @@ struct QueryPlanner: Sendable {
         // language instead of silently turning it into a person filter.
         let identity = resolved.count == 1 ? resolved.first : nil
         let recency = recencyRequest(in: question, sourceIntent: sourceIntent)
-        let stopWords: Set<String> = [
-            "what", "did", "tell", "told", "say", "said", "me", "night", "summarize", "our",
-            "conversation", "the", "about", "with", "and", "from", "my", "contact", "please", "this",
-            "morning", "today", "yesterday", "tomorrow", "week", "message", "messages", "chat", "on", "at",
-            "in", "during", "find", "found", "locate", "show", "list", "a", "an", "for", "it", "is", "are",
-            "was", "were", "do", "does", "can", "you", "of", "to", "be", "there", "any", "where", "which",
-            "mention", "mentions", "contains", "containing", "titled", "called", "named",
-            "he", "she", "they", "him", "her", "them", "his", "hers", "their", "theirs", "that", "those",
-            "go", "dig", "going", "deeper", "more", "elaborate", "expand", "continue", "else",
-            "detail", "details", "context", "info", "catch", "catchup", "caught", "up", "anything",
-            "new", "sent", "recently", "few",
-            "when", "who", "whom", "whose", "how", "why", "get", "got", "gets", "need", "needs", "have",
-            "has", "had", "remind", "happened", "happen", "happens", "miss", "missed", "talk", "talked",
-            "talking", "meet", "met", "write", "wrote", "written", "everything", "all", "some", "something",
-            "give", "gave", "know", "want", "wants", "should", "would", "could", "will", "just", "also",
-            "like", "let", "lets", "see", "check", "look", "due", "its", "i", "im", "ive", "we", "us",
-            "they", "or", "but", "if", "so", "than", "then", "because", "again", "really"
-        ]
         var dateTokens: Set<String> = [
             "january", "jan", "february", "feb", "march", "mar", "april", "apr", "may", "june", "jun",
             "july", "jul", "august", "aug", "september", "sep", "october", "oct", "november", "nov",
@@ -91,7 +91,7 @@ struct QueryPlanner: Sendable {
             resolvedPersonTokens: resolvedPersonTokens
         )
         let currentKeywords = questionTokens.enumerated().filter { index, token in
-            !stopWords.contains(token)
+            !Self.queryStopWords.contains(token)
                 && !dateTokens.contains(token)
                 && !recency.excludedTokenIndices.contains(index)
                 && !(date != nil && ["last", "night", "week"].contains(token))
@@ -794,22 +794,6 @@ struct QueryPlanner: Sendable {
             "latest", "latests", "lastest", "newest", "recent", "most", "last", "upcoming", "next",
             "received", "incoming", "unread", "new"
         ]
-        let stopWords: Set<String> = [
-            "what", "did", "tell", "told", "say", "said", "me", "night", "summarize", "our", "conversation",
-            "the", "about", "with", "and", "from", "my", "contact", "please", "this", "morning", "today",
-            "yesterday", "tomorrow", "week", "message", "messages", "chat", "on", "at", "in", "during", "find",
-            "found", "locate", "show", "list", "a", "an", "for", "it", "is", "are", "was", "were", "do", "does",
-            "can", "you", "of", "to", "be", "there", "any", "where", "which", "mention", "mentions", "contains",
-            "containing", "titled", "called", "named", "he", "she", "they", "him", "her", "them", "his", "hers",
-            "their", "theirs", "go", "dig", "going", "deeper", "more", "elaborate", "expand", "continue", "else",
-            "detail", "details", "context", "info", "catch", "catchup", "caught", "up", "anything", "new", "sent",
-            "recently", "few", "when", "who", "whom", "whose", "how", "why", "get", "got", "gets", "need", "needs",
-            "have", "has", "had", "remind", "happened", "happen", "happens", "miss", "missed", "talk", "talked",
-            "talking", "meet", "met", "write", "wrote", "written", "everything", "all", "some", "something", "give",
-            "gave", "know", "want", "wants", "should", "would", "could", "will", "just", "also", "like", "let",
-            "lets", "see", "check", "look", "due", "its", "i", "im", "ive", "we", "us", "they", "or", "but", "if",
-            "so", "than", "then", "because", "again", "really"
-        ]
         for length in stride(from: min(2, tokens.count), through: 1, by: -1) {
             guard length <= tokens.count else { continue }
             for start in 0...(tokens.count - length) {
@@ -821,7 +805,7 @@ struct QueryPlanner: Sendable {
                           Int(candidate) == nil,
                           !candidate.contains("@"),
                           !Self.isPhoneLike(candidate),
-                          !stopWords.contains(candidate),
+                          !Self.queryStopWords.contains(candidate),
                           !sourceTokens.contains(candidate),
                           !recencyTokens.contains(candidate) else { continue }
                 }
