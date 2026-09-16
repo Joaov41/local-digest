@@ -470,6 +470,144 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertTrue(AppStore.mergeConversationEvidence(retrieved: [], prior: [oldEvidence], constraints: changedDate.constraints).isEmpty)
     }
 
+    func testScreenshotContactSequenceKeepsGrammarAndDateTyposOutOfFTS() {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(calendar: calendar, now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "rafaela", displayName: "Rafaela Martins", aliases: ["Rafaela"], handles: ["rafaela@example.test"]),
+                ContactIdentity(id: "cachinhos", displayName: "Cachinhos", aliases: [], handles: ["cachinhos@example.test"])
+            ])
+        )
+
+        let first = planner.plan("what did Rafaea asked me today?", referenceDate: reference)
+        let second = planner.plan("what did Rafaela said today?", context: first, referenceDate: reference)
+        let third = planner.plan("What did Cachinhos said toyda?", context: second, referenceDate: reference)
+
+        XCTAssertEqual(first.constraints.person, "Rafaela Martins")
+        XCTAssertTrue(first.keywords.isEmpty)
+        XCTAssertEqual(second.constraints.person, "Rafaela Martins")
+        XCTAssertTrue(second.keywords.isEmpty)
+        XCTAssertEqual(third.constraints.person, "Cachinhos")
+        XCTAssertTrue(third.keywords.isEmpty)
+        XCTAssertEqual(third.constraints.startDate, calendar.startOfDay(for: reference))
+        XCTAssertEqual(third.constraints.endDate, calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: reference)))
+    }
+
+    func testScreenshotContactSequenceRetrievesRafaelaAndKeepsCachinhosTodayEmpty() async throws {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let today = calendar.startOfDay(for: reference).addingTimeInterval(3_600)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: today)!
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("local-digest-query-regression-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(atPath: url.path + "-shm")
+            try? FileManager.default.removeItem(atPath: url.path + "-wal")
+        }
+
+        let index = SQLiteIndex(databaseURL: url)
+        try await index.merge(source: .messages, with: [
+            IndexedRecord(id: "rafaela-today", source: .messages, title: "Rafaela", body: "Shipment is ready", author: "rafaela@example.test", participants: ["rafaela@example.test"], timestamp: today, url: nil, threadID: nil),
+            IndexedRecord(id: "cachinhos-yesterday", source: .messages, title: "Cachinhos", body: "Earlier update", author: "cachinhos@example.test", participants: ["cachinhos@example.test"], timestamp: yesterday, url: nil, threadID: nil),
+            IndexedRecord(id: "unrelated-today", source: .messages, title: "Other", body: "Unrelated update", author: "other@example.test", participants: ["other@example.test"], timestamp: today, url: nil, threadID: nil)
+        ])
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(calendar: calendar, now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "rafaela", displayName: "Rafaela Martins", aliases: ["Rafaela"], handles: ["rafaela@example.test"]),
+                ContactIdentity(id: "cachinhos", displayName: "Cachinhos", aliases: [], handles: ["cachinhos@example.test"])
+            ])
+        )
+        let scope = SearchScope(selectedSources: [.messages])
+
+        let first = planner.plan("what did Rafaea asked me today?", scope: scope, referenceDate: reference)
+        let firstHits = try await index.search(plan: first)
+        XCTAssertEqual(firstHits.map(\.record.id), ["rafaela-today"])
+
+        let second = planner.plan("what did Rafaela said today?", scope: scope, context: first, referenceDate: reference)
+        let secondHits = try await index.search(plan: second)
+        XCTAssertEqual(secondHits.map(\.record.id), ["rafaela-today"])
+
+        let third = planner.plan("What did Cachinhos said toyda?", scope: scope, context: second, referenceDate: reference)
+        let thirdHits = try await index.search(plan: third)
+        XCTAssertTrue(thirdHits.isEmpty)
+
+        let latest = planner.plan("latest messages from Cachinhos", scope: scope, referenceDate: reference)
+        let latestHits = try await index.search(plan: latest)
+        XCTAssertEqual(latestHits.map(\.record.id), ["cachinhos-yesterday"])
+    }
+
+    func testAskedRemainsSearchableWhenItIsAnExplicitTopic() {
+        let planner = QueryPlanner(
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "rafaela", displayName: "Rafaela Martins", aliases: ["Rafaela"], handles: ["rafaela@example.test"])
+            ])
+        )
+
+        let mention = planner.plan("find messages mentioning asked", scope: SearchScope(selectedSources: [.messages]))
+        let semanticTopic = planner.plan("What did Rafaela say about being asked today?")
+
+        XCTAssertTrue(mention.keywords.contains("asked"))
+        XCTAssertTrue(semanticTopic.keywords.contains("asked"))
+        XCTAssertTrue(semanticTopic.keywords.contains("being"))
+    }
+
+    func testChangedPersonDoesNotInheritPriorTopicButSamePersonCan() {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "rafaela", displayName: "Rafaela Martins", aliases: ["Rafaela"], handles: ["rafaela@example.test"]),
+                ContactIdentity(id: "cachinhos", displayName: "Cachinhos", aliases: [], handles: ["cachinhos@example.test"])
+            ])
+        )
+        let prior = planner.plan("what did Rafaela say about shipment yesterday?", referenceDate: reference)
+
+        let samePerson = planner.plan("what did Rafaela say today?", context: prior, referenceDate: reference)
+        let changedPerson = planner.plan("what did Cachinhos say today?", context: prior, referenceDate: reference)
+
+        XCTAssertEqual(samePerson.keywords, ["shipment"])
+        XCTAssertEqual(changedPerson.constraints.person, "Cachinhos")
+        XCTAssertTrue(changedPerson.keywords.isEmpty)
+
+        for continuation in ["And Cachinhos?", "What about Cachinhos?"] {
+            let continued = planner.plan(continuation, context: prior, referenceDate: reference)
+            XCTAssertEqual(continued.constraints.person, "Cachinhos", continuation)
+            XCTAssertEqual(continued.keywords, ["shipment"], continuation)
+            XCTAssertTrue(continued.continuesConversation, continuation)
+        }
+    }
+
+    func testTemporalTypoMapsToTodayForFreshAndContextPlansAcrossSources() {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(calendar: calendar, now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "rafaela", displayName: "Rafaela Martins", aliases: ["Rafaela"], handles: ["rafaela@example.test"])
+            ])
+        )
+        let yesterday = planner.plan("what did Rafaela say yesterday?", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference)
+        let freshMessages = planner.plan("what did Rafaela say toyda?", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference)
+        let contextMessages = planner.plan("what did Rafaela say toyda?", scope: SearchScope(selectedSources: [.messages]), context: yesterday, referenceDate: reference)
+        let freshMail = planner.plan("what is in mail toyda?", scope: SearchScope(selectedSources: [.mail]), referenceDate: reference)
+
+        let todayStart = calendar.startOfDay(for: reference)
+        let todayEnd = calendar.date(byAdding: .day, value: 1, to: todayStart)
+        for plan in [freshMessages, contextMessages, freshMail] {
+            XCTAssertEqual(plan.constraints.startDate, todayStart)
+            XCTAssertEqual(plan.constraints.endDate, todayEnd)
+            XCTAssertTrue(plan.keywords.isEmpty)
+        }
+        XCTAssertEqual(contextMessages.constraints.sources, [.messages])
+        XCTAssertEqual(freshMail.constraints.sources, [.mail])
+    }
+
     func testExplicitMailRefinesConversationWithoutDroppingPersonOrDate() {
         let reference = ISO8601DateFormatter().date(from: "2026-08-21T12:00:00Z")!
         var calendar = Calendar(identifier: .gregorian)
