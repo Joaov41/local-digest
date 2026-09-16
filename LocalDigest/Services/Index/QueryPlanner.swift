@@ -328,6 +328,11 @@ struct QueryPlanner: Sendable {
         let modelSourceTokens = Set((structuredIntent.sources ?? []).flatMap { sourceWords(for: $0) })
         let modelDateTokens = Set(structuredIntent.timeframePhrase.flatMap(IdentityResolver.tokens) ?? [])
         let removedModelTokens = modelPersonTokens.union(modelSourceTokens).union(modelDateTokens)
+        let hasModelSignal = structuredIntent.sources != nil
+            || structuredIntent.personPhrase.map { !$0.isEmpty } == true
+            || structuredIntent.timeframePhrase.map { !$0.isEmpty } == true
+            || structuredIntent.ordering != nil
+            || structuredIntent.requestedCount != nil
         var keywords: [String]
         if let topic = structuredIntent.topicPhrase, !topic.isEmpty {
             keywords = IdentityResolver.tokens(topic).filter { token in
@@ -335,6 +340,8 @@ struct QueryPlanner: Sendable {
                     && !removedModelTokens.contains(token)
                     && Int(token) == nil
             }
+        } else if hasModelSignal {
+            keywords = []
         } else {
             keywords = base.keywords.filter { !removedModelTokens.contains($0) }
         }

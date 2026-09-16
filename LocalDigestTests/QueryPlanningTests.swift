@@ -2110,6 +2110,39 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertTrue(plan.keywords.contains("tracking"))
     }
 
+    func testEmptyModelTopicWithIntentSignalsClearsRuleKeywords() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-08-28T12:00:00Z")!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(
+                    id: "rui",
+                    displayName: "Rui Almeida",
+                    aliases: ["Rui"],
+                    handles: ["rui@example.test"]
+                )
+            ])
+        )
+        let prior = planner.plan("What did Rui tell me this week?", referenceDate: reference)
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(
+            sources: [.messages],
+            personPhrase: "she",
+            requestedCount: 5,
+            ordering: .newestFirst,
+            continuesConversation: true
+        ))
+        let plan = await HybridQueryPlanner(planner: planner, interpreter: interpreter)
+            .plan(
+                "What has she sent recently?",
+                context: prior,
+                referenceDate: reference
+            )
+
+        XCTAssertTrue(plan.keywords.isEmpty)
+        XCTAssertEqual(plan.constraints.person, "Rui Almeida")
+        XCTAssertEqual(plan.ordering, .newestFirst)
+    }
+
     func testHybridPronounFollowUpInheritsPersonButUsesModelOrdering() async {
         let reference = ISO8601DateFormatter().date(from: "2026-08-28T12:00:00Z")!
         let planner = QueryPlanner(
