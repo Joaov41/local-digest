@@ -34,15 +34,25 @@ struct QueryPlanner: Sendable {
         self.identityResolver = identityResolver
     }
 
-    func plan(_ question: String, scope: SearchScope = SearchScope(), context: QueryPlan? = nil, referenceDate: Date? = nil) -> QueryPlan {
+    func plan(_ question: String, scope: SearchScope = SearchScope(), context: QueryPlan? = nil, referenceDate: Date? = nil, surface: QuerySurface = .ask) -> QueryPlan {
         let date = dateParser.parse(question, referenceDate: referenceDate)
         let sourceIntent = explicitSource(in: question)
-        let personPhrase: String?
+        let explicitPersonPhrase: String?
         if sourceIntent == nil || sourceIntent?.source == .mail || sourceIntent?.source == .messages {
-            personPhrase = extractPersonPhrase(from: question, sourceIntent: sourceIntent).flatMap(Self.withoutPronouns)
+            explicitPersonPhrase = extractPersonPhrase(from: question, sourceIntent: sourceIntent).flatMap(Self.withoutPronouns)
         } else {
-            personPhrase = nil
+            explicitPersonPhrase = nil
         }
+        // Elliptical continuations intentionally change only the person
+        // boundary while retaining the prior topic, for example "And
+        // Cachinhos?" after a shipment question. Complete replacement
+        // questions continue through explicitPersonPhrase and reset topics
+        // when the contact changes.
+        let continuationPersonPhrase = context != nil
+            ? extractContinuationPersonPhrase(from: question)
+            : nil
+        let personPhrase = explicitPersonPhrase ?? continuationPersonPhrase
+        let isContinuationPersonChange = explicitPersonPhrase == nil && continuationPersonPhrase != nil
         let resolved = personPhrase.map(identityResolver.resolveWithConservativeFuzzy) ?? []
         // A person slot is safe only when it resolves to one consolidated
         // identity.  Keep an ambiguous or unknown phrase as ordinary query
@@ -61,29 +71,35 @@ struct QueryPlanner: Sendable {
             "detail", "details", "context", "info", "catch", "catchup", "caught", "up", "anything",
             "new", "sent", "recently", "few"
         ]
-        let dateTokens: Set<String> = [
+        var dateTokens: Set<String> = [
             "january", "jan", "february", "feb", "march", "mar", "april", "apr", "may", "june", "jun",
             "july", "jul", "august", "aug", "september", "sep", "october", "oct", "november", "nov",
             "december", "dec", "monday", "mon", "tuesday", "tue", "wednesday", "wed", "thursday", "thu",
             "friday", "fri", "saturday", "sat", "sunday", "sun", "next", "previous"
         ]
+        dateTokens.formUnion(DatePhraseParser.temporalTypoTokens)
         let resolvedPersonTokens = Set(
             ((identity.map { [$0.displayName] + $0.aliases + $0.handles } ?? []) + (resolved.isEmpty ? [] : [personPhrase].compactMap { $0 }))
                 .flatMap(IdentityResolver.tokens)
         )
         let questionTokens = IdentityResolver.tokens(question)
+        let communicationGrammarVerbIndices = communicationGrammarVerbIndices(
+            in: questionTokens,
+            resolvedPersonTokens: resolvedPersonTokens
+        )
         let currentKeywords = questionTokens.enumerated().filter { index, token in
             !stopWords.contains(token)
                 && !dateTokens.contains(token)
                 && !recency.excludedTokenIndices.contains(index)
                 && !(date != nil && ["last", "night", "week"].contains(token))
+                && !communicationGrammarVerbIndices.contains(index)
                 && !resolvedPersonTokens.contains(token)
                 && !(sourceIntent?.excludedTokens.contains(token) ?? false)
                 && Int(token) == nil
                 && token.count > 2
         }.map(\.element)
         let communicationQuestion = isCommunicationQuestion(question)
-        let isExactLookup = isExactLookupQuestion(question)
+        let isExactLookup = isExactLookupQuestion(question, surface: surface)
         let lookupScope = isExactLookup ? lookupScope(for: question) : .topic
         // A newly stated date replaces the prior date window, while the
         // conversational person/source/topic context remains useful.
@@ -93,7 +109,27 @@ struct QueryPlanner: Sendable {
         // new turn, while the planner still carries compatible context.
         let inheritsConversation = context != nil
         let canInheritTopic = sourceIntent == nil || sourceIntent?.source == .mail || sourceIntent?.source == .messages
-        let inheritedKeywords = inheritsConversation && canInheritTopic && (currentKeywords.isEmpty || isFollowUp)
+        let personBoundaryAllowsTopicInheritance: Bool
+        if isContinuationPersonChange {
+            personBoundaryAllowsTopicInheritance = true
+        } else if personPhrase == nil {
+            personBoundaryAllowsTopicInheritance = true
+        } else if let identity, let priorPerson = context?.constraints.person {
+            // An explicitly named person keeps a prior topic only when it is
+            // the same consolidated identity. Switching contacts starts a
+            // fresh topic search instead of carrying irrelevant FTS terms.
+            personBoundaryAllowsTopicInheritance = IdentityResolver.normalize(identity.displayName)
+                == IdentityResolver.normalize(priorPerson)
+        } else if context?.constraints.person != nil {
+            // An unresolved or ambiguous person cannot inherit a topic that
+            // was scoped to the prior contact.
+            personBoundaryAllowsTopicInheritance = false
+        } else {
+            // With no prior person scope, an explicit person can still refine
+            // the existing conversational topic.
+            personBoundaryAllowsTopicInheritance = true
+        }
+        let inheritedKeywords = inheritsConversation && canInheritTopic && personBoundaryAllowsTopicInheritance && (currentKeywords.isEmpty || isFollowUp)
             ? (context?.keywords ?? []).filter { !["latest", "newest", "recent", "most", "last"].contains($0) }
             : []
         let keywords = orderedUnique(currentKeywords + inheritedKeywords)
@@ -171,7 +207,10 @@ struct QueryPlanner: Sendable {
                 lookupScope: .topic,
                 continuesConversation: true,
                 ordering: context.ordering,
-                requestedResultCount: context.requestedResultCount
+                requestedResultCount: context.requestedResultCount,
+                retrievalPolicy: context.retrievalPolicy,
+                hasUnresolvedPersonPhrase: context.hasUnresolvedPersonPhrase,
+                surface: surface
             )
         }
 
@@ -188,6 +227,16 @@ struct QueryPlanner: Sendable {
             scopedPersonTerms = personTerms
         }
 
+        let hasUnresolvedPersonPhrase = personPhrase != nil && identity == nil && resolved.isEmpty
+        let retrievalPolicy = Self.retrievalPolicy(
+            surface: surface,
+            mode: isExactLookup ? .exactLookup : .questionAnswer,
+            lookupScope: lookupScope,
+            hasUnresolvedPersonPhrase: hasUnresolvedPersonPhrase,
+            hasResolvedPersonBoundary: identity != nil || scope.selectedPerson != nil || context?.constraints.person != nil,
+            hasDateBoundary: date != nil || context?.constraints.startDate != nil,
+            hasSourceBoundary: sourceIntent != nil
+        )
         return QueryPlan(
             originalQuestion: question,
             keywords: keywords,
@@ -199,7 +248,10 @@ struct QueryPlanner: Sendable {
             lookupScope: lookupScope,
             continuesConversation: context != nil,
             ordering: effectiveOrdering,
-            requestedResultCount: effectiveCount
+            requestedResultCount: effectiveCount,
+            retrievalPolicy: retrievalPolicy,
+            hasUnresolvedPersonPhrase: hasUnresolvedPersonPhrase,
+            surface: surface
         )
     }
 
@@ -212,9 +264,10 @@ struct QueryPlanner: Sendable {
         scope: SearchScope = SearchScope(),
         context: QueryPlan? = nil,
         referenceDate: Date? = nil,
-        structuredIntent: StructuredQueryIntent
+        structuredIntent: StructuredQueryIntent,
+        surface: QuerySurface = .ask
     ) -> QueryPlan {
-        let base = plan(question, scope: scope, context: context, referenceDate: referenceDate)
+        let base = plan(question, scope: scope, context: context, referenceDate: referenceDate, surface: surface)
         let reference = referenceDate ?? Date()
         let deterministicDate = dateParser.parse(question, referenceDate: reference)
         let modelDate = deterministicDate == nil
@@ -240,8 +293,12 @@ struct QueryPlanner: Sendable {
         var ambiguity = base.ambiguity
         var keywords = base.keywords
         let deterministicPersonPhrase = extractPersonPhrase(from: question, sourceIntent: sourceIntent).flatMap(Self.withoutPronouns)
-        let hasDeterministicPerson = deterministicPersonPhrase != nil
+        // A locally resolved person is authoritative. An unresolved rule
+        // phrase is only a candidate and may be repaired by a copied model
+        // phrase that resolves uniquely.
+        let hasDeterministicPerson = deterministicPersonPhrase != nil && !base.hasUnresolvedPersonPhrase
         var resolvedModelPerson = false
+        var hasUnresolvedPersonPhrase = base.hasUnresolvedPersonPhrase
         if !hasDeterministicPerson, let phrase = structuredIntent.personPhrase,
            let cleanPhrase = Self.withoutPronouns(phrase) {
             let resolved = identityResolver.resolveWithConservativeFuzzy(cleanPhrase)
@@ -250,18 +307,21 @@ struct QueryPlanner: Sendable {
                 constraints.personTerms = [identity.displayName] + identity.aliases + identity.handles
                 ambiguity = []
                 resolvedModelPerson = true
+                hasUnresolvedPersonPhrase = false
             } else if resolved.count > 1 {
                 constraints.person = nil
                 constraints.personTerms = []
                 ambiguity = orderedUnique(resolved.map(\.displayName))
                 let personTokens = Set(IdentityResolver.tokens(cleanPhrase))
                 keywords.removeAll { personTokens.contains($0) }
+                hasUnresolvedPersonPhrase = true
             } else {
                 // An unresolved model phrase is an explicit new-turn person
                 // field. Clear inherited person state and retain its words
                 // as ordinary FTS terms below, never as a person filter.
                 constraints.person = nil
                 constraints.personTerms = []
+                hasUnresolvedPersonPhrase = true
             }
         }
 
@@ -293,17 +353,21 @@ struct QueryPlanner: Sendable {
         }
         keywords = orderedUnique(keywords)
 
-        let deterministicOrdering = base.ordering != .relevance || base.requestedResultCount != nil
-        let ordering = deterministicOrdering ? base.ordering : (structuredIntent.ordering ?? base.ordering)
+        let currentRecency = recencyRequest(in: question, sourceIntent: sourceIntent)
+        let hasCurrentOrdering = currentRecency.ordering != .relevance
+        let hasCurrentCount = currentRecency.count != nil
+        let ordering = hasCurrentOrdering
+            ? currentRecency.ordering
+            : (structuredIntent.ordering ?? base.ordering)
         let requestedCount: Int?
-        if base.requestedResultCount != nil {
-            requestedCount = base.requestedResultCount
+        if hasCurrentCount {
+            requestedCount = currentRecency.count
         } else if let modelCount = structuredIntent.requestedCount {
             requestedCount = modelCount
         } else if ordering != .relevance {
-            requestedCount = 5
+            requestedCount = hasCurrentOrdering || structuredIntent.ordering != nil ? 5 : base.requestedResultCount
         } else {
-            requestedCount = nil
+            requestedCount = base.requestedResultCount
         }
 
         let modelSingleSource = structuredIntent.sources?.count == 1
@@ -325,6 +389,7 @@ struct QueryPlanner: Sendable {
             constraints.person = selectedPerson
             constraints.personTerms = [selectedPerson]
             ambiguity = []
+            hasUnresolvedPersonPhrase = false
         }
 
         // A unique local identity is the only model-person result that may
@@ -332,6 +397,16 @@ struct QueryPlanner: Sendable {
         // and keeps the safety rule visible at the merge point.
         _ = resolvedModelPerson
         _ = modelDate
+        let retrievalPolicy = Self.retrievalPolicy(
+            surface: surface,
+            mode: base.mode,
+            lookupScope: base.lookupScope,
+            hasUnresolvedPersonPhrase: hasUnresolvedPersonPhrase,
+            hasResolvedPersonBoundary: constraints.person != nil,
+            hasDateBoundary: constraints.startDate != nil,
+            hasSourceBoundary: sourceIntent != nil || structuredIntent.sources != nil
+        )
+
         return QueryPlan(
             originalQuestion: base.originalQuestion,
             keywords: keywords,
@@ -349,8 +424,28 @@ struct QueryPlanner: Sendable {
             lookupScope: base.lookupScope,
             continuesConversation: base.continuesConversation || (structuredIntent.continuesConversation && context != nil),
             ordering: ordering,
-            requestedResultCount: requestedCount
+            requestedResultCount: requestedCount,
+            retrievalPolicy: retrievalPolicy,
+            hasUnresolvedPersonPhrase: hasUnresolvedPersonPhrase,
+            surface: surface
         )
+    }
+
+    private static func retrievalPolicy(
+        surface: QuerySurface,
+        mode: QueryMode,
+        lookupScope: LookupScope,
+        hasUnresolvedPersonPhrase: Bool,
+        hasResolvedPersonBoundary: Bool,
+        hasDateBoundary: Bool,
+        hasSourceBoundary: Bool
+    ) -> QueryRetrievalPolicy {
+        guard surface == .ask, mode == .questionAnswer, lookupScope == .topic else { return .literalKeywords }
+        // An explicit but unresolved person remains lexical language. This
+        // prevents a date-only fallback from broadening across other people.
+        guard !hasUnresolvedPersonPhrase else { return .literalKeywords }
+        guard hasResolvedPersonBoundary || hasDateBoundary || hasSourceBoundary else { return .literalKeywords }
+        return .scopedSemanticEvidence
     }
 
     private func orderedUnique(_ values: [String]) -> [String] {
@@ -399,6 +494,33 @@ struct QueryPlanner: Sendable {
         let defaultCount = pluralNouns.contains(tokens.first(where: { sourceNouns.contains($0) }) ?? "") ? 5 : 1
         if hasUpcoming { return (.upcomingFirst, count ?? 5, structuralOperators) }
         return (.newestFirst, count ?? defaultCount, structuralOperators)
+    }
+
+    /// Removes only question-grammar uses of ask/asked. The same words must
+    /// remain searchable when they are the requested topic, such as
+    /// "messages mentioning asked" or "about being asked".
+    private func communicationGrammarVerbIndices(in tokens: [String], resolvedPersonTokens: Set<String>) -> Set<Int> {
+        let verbs: Set<String> = ["ask", "asked", "asks", "asking"]
+        let auxiliaries: Set<String> = ["did", "does", "do", "can", "could", "would", "will", "was", "were", "is", "are"]
+        let recipients: Set<String> = ["me", "you", "us", "him", "her", "them"]
+        let questionMarkers: Set<String> = ["what", "who", "when", "where", "which", "why", "how"]
+        var indices = Set<Int>()
+        for (index, token) in tokens.enumerated() where verbs.contains(token) {
+            let previous = index > 0 ? tokens[index - 1] : nil
+            let next = index + 1 < tokens.count ? tokens[index + 1] : nil
+            let followsPerson = previous.map(resolvedPersonTokens.contains) ?? false
+            let followsAuxiliary = previous.map(auxiliaries.contains) ?? false
+            let hasQuestionMarker = tokens.contains(where: questionMarkers.contains)
+            let hasRecipient = next.map(recipients.contains) ?? false
+            // An auxiliary alone is not enough: "messages mentioning was
+            // asked" is a valid topic search. Require an interrogative
+            // question shape unless a resolved person/recipient makes the
+            // communication verb structural.
+            guard (hasQuestionMarker && followsAuxiliary)
+                || (followsPerson && (hasRecipient || hasQuestionMarker)) else { continue }
+            indices.insert(index)
+        }
+        return indices
     }
 
     /// Returns recency/future operators only when the operator is structurally
@@ -570,11 +692,22 @@ struct QueryPlanner: Sendable {
         return nil
     }
 
-    private func isExactLookupQuestion(_ question: String) -> Bool {
+    private func isExactLookupQuestion(_ question: String, surface: QuerySurface) -> Bool {
         let normalized = question.lowercased()
+        let hasQuotedPhrase = normalized.contains("\"") || normalized.contains("“") || normalized.contains("”")
+        let explicitLiteralMarkers = [
+            "mention ", "mentions ", "mentioning ", "contains ", "containing ", "titled ", "called ", "named "
+        ]
+        if hasQuotedPhrase || explicitLiteralMarkers.contains(where: normalized.contains) { return true }
+        if surface == .ask {
+            // A note-specific find/any request remains a useful literal
+            // lookup, while ordinary Ask commands such as "List everything
+            // I need to do tomorrow" remain natural-language questions.
+            return ["find a note", "which note", "any note", "any notes"].contains(where: normalized.contains)
+        }
         return [
-            "find ", "locate ", "show me ", "which note", "where is ", "list ",
-            "any note", "any notes", "any mention", "do i have ", "are there "
+            "find ", "locate ", "which note", "list ", "any note", "any notes", "any mention",
+            "do i have ", "are there "
         ].contains(where: normalized.contains)
     }
 
@@ -603,6 +736,24 @@ struct QueryPlanner: Sendable {
         return extractKnownPersonBeforeSource(from: question, sourceIntent: sourceIntent)
     }
 
+    /// Extracts a known contact from a deliberately elliptical continuation.
+    /// Only the leading "and <person>" and "what about <person>" shapes are
+    /// accepted, so an ordinary replacement question cannot accidentally
+    /// inherit a prior topic.
+    private func extractContinuationPersonPhrase(from question: String) -> String? {
+        let tokens = IdentityResolver.tokens(question)
+        let candidateTokens: ArraySlice<String>
+        if tokens.first == "and" {
+            candidateTokens = tokens.dropFirst()
+        } else if tokens.count >= 2, tokens[0] == "what", tokens[1] == "about" {
+            candidateTokens = tokens.dropFirst(2)
+        } else {
+            return nil
+        }
+        guard !candidateTokens.isEmpty else { return nil }
+        return longestKnownIdentityPrefix(in: candidateTokens.joined(separator: " "))
+    }
+
     private func extractMarkedPersonPhrase(from question: String) -> String? {
         let lowered = question.lowercased()
         if let range = lowered.range(of: "did ") {
@@ -616,7 +767,17 @@ struct QueryPlanner: Sendable {
                 if let stop = candidate.lowercased().range(of: stopWord) { candidate = String(candidate[..<stop.lowerBound]); break }
             }
             let name = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !name.isEmpty { return name }
+            if !name.isEmpty {
+                // A natural question can continue past the contact with an
+                // unlisted verb ("How much did Rafaela need?"). Prefer the
+                // longest locally known identity prefix instead of treating
+                // the rest of that clause as a person name.
+                if let resolvedPrefix = longestKnownIdentityPrefix(in: name) {
+                    return resolvedPrefix
+                }
+                guard !Self.isPronounLed(name) else { return nil }
+                return name
+            }
         }
         let markers = ["contact ", "with ", "from ", "for "]
         for marker in markers {
@@ -633,6 +794,7 @@ struct QueryPlanner: Sendable {
                 if let resolvedPrefix = longestKnownIdentityPrefix(in: cleaned) {
                     return resolvedPrefix
                 }
+                guard !Self.isPronounLed(cleaned) else { continue }
                 let nonPersonTokens: Set<String> = [
                     "today", "yesterday", "tomorrow", "this", "morning", "night", "week", "latest", "newest", "recent",
                     "most", "last", "upcoming", "next", "email", "emails", "mail", "message", "messages", "chat"
@@ -642,6 +804,11 @@ struct QueryPlanner: Sendable {
             }
         }
         return nil
+    }
+
+    private static func isPronounLed(_ phrase: String) -> Bool {
+        let pronouns: Set<String> = ["he", "she", "they", "him", "her", "them", "his", "hers", "their", "theirs", "i", "you"]
+        return IdentityResolver.tokens(phrase).first.map(pronouns.contains) ?? false
     }
 
     private func longestKnownIdentityPrefix(in phrase: String) -> String? {
@@ -716,22 +883,41 @@ struct QueryPlanner: Sendable {
     }
 }
 
-/// Runs the optional model only for queries whose deterministic plan leaves
-/// meaningful language intent unresolved. High-confidence source/date/person
-/// queries keep the existing synchronous path and incur no model call.
+/// Runs the optional model for natural Ask language whose meaning can benefit
+/// from interpretation. Deterministic constraints remain authoritative and
+/// Search-surface requests stay lexical without a model call.
 struct HybridQueryPlanner: Sendable {
-    static let interpretationTimeoutNanoseconds: UInt64 = 800_000_000
+    static let defaultInterpretationTimeoutNanoseconds: UInt64 = 8_000_000_000
 
     let deterministic: QueryPlanner
     let interpreter: (any QueryIntentInterpreting)?
+    let surface: QuerySurface
+    let interpretationTimeoutNanoseconds: UInt64
 
-    init(deterministic: QueryPlanner, interpreter: (any QueryIntentInterpreting)? = nil) {
+    init(
+        deterministic: QueryPlanner,
+        interpreter: (any QueryIntentInterpreting)? = nil,
+        surface: QuerySurface = .ask,
+        interpretationTimeoutNanoseconds: UInt64 = Self.defaultInterpretationTimeoutNanoseconds
+    ) {
         self.deterministic = deterministic
         self.interpreter = interpreter
+        self.surface = surface
+        self.interpretationTimeoutNanoseconds = interpretationTimeoutNanoseconds
     }
 
-    init(planner: QueryPlanner, interpreter: (any QueryIntentInterpreting)? = nil) {
-        self.init(deterministic: planner, interpreter: interpreter)
+    init(
+        planner: QueryPlanner,
+        interpreter: (any QueryIntentInterpreting)? = nil,
+        surface: QuerySurface = .ask,
+        interpretationTimeoutNanoseconds: UInt64 = Self.defaultInterpretationTimeoutNanoseconds
+    ) {
+        self.init(
+            deterministic: planner,
+            interpreter: interpreter,
+            surface: surface,
+            interpretationTimeoutNanoseconds: interpretationTimeoutNanoseconds
+        )
     }
 
     func plan(
@@ -741,13 +927,12 @@ struct HybridQueryPlanner: Sendable {
         referenceDate: Date? = nil,
         provider: AIProvider = .appleLocal
     ) async -> QueryPlan {
-        let fallback = deterministic.plan(question, scope: scope, context: context, referenceDate: referenceDate)
-        // A date inherited from an active conversation is not a new explicit
-        // date field. Keep the model available to fill an omitted ordering or
-        // source in a pronoun follow-up, while still bypassing it for a
-        // high-confidence person + date stated on this turn.
-        let hasExplicitDate = deterministic.dateParser.parse(question, referenceDate: referenceDate) != nil
-        guard Self.shouldInterpret(fallback, hasExplicitDate: hasExplicitDate), let interpreter else { return fallback }
+        let fallback = deterministic.plan(question, scope: scope, context: context, referenceDate: referenceDate, surface: surface)
+        guard surface == .ask else { return fallback }
+        // Keep the model available for unresolved natural-language meaning
+        // even when local planning already found a person, date, or source.
+        // The local plan remains authoritative when the model result merges.
+        guard Self.shouldInterpret(fallback, surface: surface), let interpreter else { return fallback }
         guard let intent = await interpretWithinBudget(
             interpreter,
             question: String(question.prefix(600)),
@@ -760,7 +945,8 @@ struct HybridQueryPlanner: Sendable {
             scope: scope,
             context: context,
             referenceDate: referenceDate,
-            structuredIntent: intent
+            structuredIntent: intent,
+            surface: surface
         )
     }
 
@@ -785,33 +971,29 @@ struct HybridQueryPlanner: Sendable {
                 await gate.finish(continuation, result: result)
             }
             Task {
-                try? await Task.sleep(nanoseconds: Self.interpretationTimeoutNanoseconds)
+                try? await Task.sleep(nanoseconds: interpretationTimeoutNanoseconds)
                 await gate.finish(continuation, result: nil)
             }
         }
     }
 
     static func shouldInterpret(_ fallback: QueryPlan) -> Bool {
-        shouldInterpret(fallback, hasExplicitDate: fallback.isConstrainedByDate)
+        shouldInterpret(fallback, surface: .ask)
     }
 
-    private static func shouldInterpret(_ fallback: QueryPlan, hasExplicitDate: Bool) -> Bool {
+    private static func shouldInterpret(_ fallback: QueryPlan, surface: QuerySurface) -> Bool {
+        guard surface == .ask else { return false }
         guard fallback.mode != .exactLookup else { return false }
-        if fallback.intent.hasExplicitBoundary { return false }
         // The established deeper-answer path reuses the prior plan and
         // evidence window. It has no unresolved search intent of its own and
         // must not spend a second model call on the literal follow-up label.
         if fallback.continuesConversation && QueryPlanner.looksLikeFollowUp(fallback.originalQuestion) {
             return false
         }
-        // An explicit date/source/order is locally authoritative. A lone
-        // person is still interpreted because natural requests often encode
-        // source and recency implicitly ("Anything new from Rui?").
-        if hasExplicitDate,
-           fallback.constraints.person != nil {
-            return false
-        }
-        if fallback.ordering != .relevance || fallback.requestedResultCount != nil { return false }
+        // Local date/person/source/order/count constraints remain authoritative
+        // during merge, but an ordering or count does not make a request
+        // literal. The model can still interpret the natural question around
+        // those current-turn operators.
         return true
     }
 }

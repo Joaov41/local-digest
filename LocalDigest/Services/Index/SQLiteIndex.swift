@@ -200,71 +200,100 @@ private actor SQLiteIndexReader {
 
     func search(plan: QueryPlan, limit: Int) throws -> [SearchHit] {
         guard let database = try openIfAvailable() else { return [] }
+        // A natural Ask request naming an unknown person must not fall back to
+        // its topical words. Doing so would let an FTS OR query return another
+        // person's records. Literal Search/exact lookups keep their normal
+        // free-text behavior; AppStore turns this empty Ask result into a
+        // clarification/grounded response.
+        if plan.surface == .ask, plan.hasUnresolvedPersonPhrase, plan.mode != .exactLookup { return [] }
         let safeLimit = max(1, limit)
-        let ftsQuery = makeFTSQuery(for: plan)
         let selectedSources = plan.constraints.sources.map(\.rawValue).sorted()
         guard !selectedSources.isEmpty else { return [] }
-        let sourcePlaceholders = Array(repeating: "?", count: selectedSources.count).joined(separator: ",")
-        var predicates = ["records.source IN (\(sourcePlaceholders))"]
-        if ftsQuery != nil { predicates.insert("records_fts MATCH ?", at: 0) }
-        if plan.constraints.startDate != nil { predicates.append("records.timestamp >= ?") }
-        if plan.constraints.endDate != nil { predicates.append("records.timestamp < ?") }
-        let join = ftsQuery == nil ? "" : "JOIN records_fts ON records_fts.rowid = records.rowid"
-        let score = ftsQuery == nil ? "0.0" : "bm25(records_fts)"
-        let ordering: String
-        if plan.ordering == .newestFirst {
-            ordering = "records.timestamp DESC"
-        } else if plan.ordering == .upcomingFirst {
-            ordering = "records.timestamp ASC"
-        } else {
-            ordering = ftsQuery == nil ? "records.timestamp DESC" : "bm25(records_fts) ASC, records.timestamp DESC"
-        }
-        let limitClause = plan.constraints.personTerms.isEmpty ? " LIMIT ?" : ""
-        let sql = "SELECT records.id, records.source, records.title, records.body, records.author, records.participants, records.timestamp, records.url, records.thread_id, \(score) FROM records \(join) WHERE \(predicates.joined(separator: " AND ")) ORDER BY \(ordering)\(limitClause);"
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw currentError() }
-        defer { sqlite3_finalize(statement) }
-        var next: Int32 = 1
-        if let ftsQuery { bind(ftsQuery, to: statement, index: next); next += 1 }
-        for source in selectedSources {
-            bind(source, to: statement, index: next)
-            next += 1
-        }
-        if let startDate = plan.constraints.startDate {
-            sqlite3_bind_double(statement, next, startDate.timeIntervalSince1970)
-            next += 1
-        }
-        if let endDate = plan.constraints.endDate {
-            sqlite3_bind_double(statement, next, endDate.timeIntervalSince1970)
-            next += 1
-        }
-        if plan.constraints.personTerms.isEmpty {
-            sqlite3_bind_int(statement, next, Int32(max(safeLimit * 20, 5000)))
+        func fetchHits(ftsQuery: String?) throws -> [SearchHit] {
+            let sourcePlaceholders = Array(repeating: "?", count: selectedSources.count).joined(separator: ",")
+            var predicates = ["records.source IN (\(sourcePlaceholders))"]
+            if ftsQuery != nil { predicates.insert("records_fts MATCH ?", at: 0) }
+            if plan.constraints.startDate != nil { predicates.append("records.timestamp >= ?") }
+            if plan.constraints.endDate != nil { predicates.append("records.timestamp < ?") }
+            let join = ftsQuery == nil ? "" : "JOIN records_fts ON records_fts.rowid = records.rowid"
+            let score = ftsQuery == nil ? "0.0" : "bm25(records_fts)"
+            let ordering: String
+            if plan.ordering == .newestFirst {
+                ordering = "records.timestamp DESC"
+            } else if plan.ordering == .upcomingFirst {
+                ordering = "records.timestamp ASC"
+            } else {
+                ordering = ftsQuery == nil ? "records.timestamp DESC" : "bm25(records_fts) ASC, records.timestamp DESC"
+            }
+            let limitClause = plan.constraints.personTerms.isEmpty ? " LIMIT ?" : ""
+            let sql = "SELECT records.id, records.source, records.title, records.body, records.author, records.participants, records.timestamp, records.url, records.thread_id, \(score) FROM records \(join) WHERE \(predicates.joined(separator: " AND ")) ORDER BY \(ordering)\(limitClause);"
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw currentError() }
+            defer { sqlite3_finalize(statement) }
+            var next: Int32 = 1
+            if let ftsQuery { bind(ftsQuery, to: statement, index: next); next += 1 }
+            for source in selectedSources {
+                bind(source, to: statement, index: next)
+                next += 1
+            }
+            if let startDate = plan.constraints.startDate {
+                sqlite3_bind_double(statement, next, startDate.timeIntervalSince1970)
+                next += 1
+            }
+            if let endDate = plan.constraints.endDate {
+                sqlite3_bind_double(statement, next, endDate.timeIntervalSince1970)
+                next += 1
+            }
+            if plan.constraints.personTerms.isEmpty {
+                sqlite3_bind_int(statement, next, Int32(max(safeLimit * 20, 5000)))
+            }
+
+            var hits: [SearchHit] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let record = record(from: statement), matches(record, constraints: plan.constraints) else { continue }
+                if plan.mode == .exactLookup, !plan.keywords.isEmpty {
+                    // Lookup/list questions must not surface records that only
+                    // matched a broad FTS branch. Every topic token must occur
+                    // in the title or body of the returned record.
+                    let searchable = record.searchableText
+                    guard plan.keywords.allSatisfy({ searchable.localizedCaseInsensitiveContains($0) }) else { continue }
+                }
+                let raw = sqlite3_column_double(statement, 9)
+                let exactTitle = plan.mode == .exactLookup && plan.keywords.contains {
+                    record.title.localizedCaseInsensitiveCompare($0) == .orderedSame
+                }
+                let exactBody = plan.mode == .exactLookup && plan.keywords.contains {
+                    record.body.localizedCaseInsensitiveCompare($0) == .orderedSame
+                }
+                let exactBoost = exactTitle ? 1_000_000.0 : (exactBody ? 100_000.0 : 0.0)
+                hits.append(SearchHit(
+                    record: record,
+                    score: exactBoost - raw,
+                    matchedSnippet: matchedSnippet(for: record, terms: plan.keywords)
+                ))
+            }
+            return hits
         }
 
-        var hits: [SearchHit] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let record = record(from: statement), matches(record, constraints: plan.constraints) else { continue }
-            if plan.mode == .exactLookup, !plan.keywords.isEmpty {
-                // Lookup/list questions must not surface records that only
-                // matched a broad FTS branch. Every topic token must occur in
-                // the title or body of the returned record.
-                let searchable = record.searchableText
-                guard plan.keywords.allSatisfy({ searchable.localizedCaseInsensitiveContains($0) }) else { continue }
-            }
-            let raw = sqlite3_column_double(statement, 9)
-            let exactTitle = plan.mode == .exactLookup && plan.keywords.contains {
-                record.title.localizedCaseInsensitiveCompare($0) == .orderedSame
-            }
-            let exactBody = plan.mode == .exactLookup && plan.keywords.contains {
-                record.body.localizedCaseInsensitiveCompare($0) == .orderedSame
-            }
-            let exactBoost = exactTitle ? 1_000_000.0 : (exactBody ? 100_000.0 : 0.0)
-            hits.append(SearchHit(
-                record: record,
-                score: exactBoost - raw,
-                matchedSnippet: matchedSnippet(for: record, terms: plan.keywords)
-            ))
+        // A validated person/date boundary is already a safe, bounded corpus
+        // slice. Do not let an incidental English keyword match hide other
+        // records in that slice, especially when the source language differs
+        // from the question. Source-only natural requests still prefer their
+        // lexical candidate set and use constraint-only evidence on a miss.
+        let hasStrongConstraintBoundary = plan.constraints.person != nil
+            || plan.constraints.startDate != nil
+            || plan.constraints.endDate != nil
+        let preferredFTSQuery = plan.retrievalPolicy == .scopedSemanticEvidence && hasStrongConstraintBoundary
+            ? nil
+            : makeFTSQuery(for: plan)
+        var hits = try fetchHits(
+            ftsQuery: preferredFTSQuery
+        )
+        if hits.isEmpty, plan.retrievalPolicy == .scopedSemanticEvidence, preferredFTSQuery != nil {
+            // Natural Ask first honors a useful lexical candidate set. If the
+            // user's language and indexed source language differ, bounded
+            // constraint-only evidence is the safe semantic fallback.
+            hits = try fetchHits(ftsQuery: nil)
         }
         let ranked: [SearchHit]
         if plan.ordering == .newestFirst {
@@ -417,10 +446,31 @@ private actor SQLiteIndexReader {
                 )
             }
         }
-        return Array(combined.values.sorted {
-            if $0.record.timestamp == $1.record.timestamp { return $0.record.id < $1.record.id }
-            return $0.record.timestamp < $1.record.timestamp
-        }.prefix(expansionCap))
+        // Conversation expansion can add older or newer records beyond the
+        // initial seed set. Keep the expansion's result in the same order as
+        // the original plan before applying its cap; otherwise a newest-first
+        // request returns the oldest expanded records.
+        let ordered: [SearchHit]
+        switch plan.ordering {
+        case .newestFirst:
+            ordered = combined.values.sorted {
+                if $0.record.timestamp == $1.record.timestamp { return $0.record.id < $1.record.id }
+                return $0.record.timestamp > $1.record.timestamp
+            }
+        case .upcomingFirst:
+            ordered = combined.values.sorted {
+                if $0.record.timestamp == $1.record.timestamp { return $0.record.id < $1.record.id }
+                return $0.record.timestamp < $1.record.timestamp
+            }
+        case .relevance:
+            // Preserve the existing chronological expansion order for
+            // relevance searches and their conversation context.
+            ordered = combined.values.sorted {
+                if $0.record.timestamp == $1.record.timestamp { return $0.record.id < $1.record.id }
+                return $0.record.timestamp < $1.record.timestamp
+            }
+        }
+        return Array(ordered.prefix(expansionCap))
     }
 
     private func makeFTSQuery(for plan: QueryPlan) -> String? {

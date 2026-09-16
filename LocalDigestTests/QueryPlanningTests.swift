@@ -820,6 +820,71 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertEqual(hits.map(\.record.id), ["thread-before", "thread-match", "thread-after"])
     }
 
+    func testConversationExpansionPreservesNewestFirstCapAndConstraints() async throws {
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-digest-conversation-ordering-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: databaseURL)
+            try? FileManager.default.removeItem(atPath: databaseURL.path + "-shm")
+            try? FileManager.default.removeItem(atPath: databaseURL.path + "-wal")
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let reference = ISO8601DateFormatter().date(from: "2026-08-28T12:00:00Z")!
+        let today = calendar.startOfDay(for: reference)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: today)!
+        let handle = "cachinhos@example.test"
+        let todayRecords = (0..<6).map { index in
+            IndexedRecord(
+                id: "cachinhos-today-\(index)", source: .messages, title: "Cachinhos \(index)", body: "Shipment update \(index)",
+                author: handle, participants: [handle], timestamp: today.addingTimeInterval(Double(index + 1) * 3_600), url: nil, threadID: "cachinhos-thread"
+            )
+        }
+        let records = todayRecords + [
+            IndexedRecord(id: "other-today", source: .messages, title: "Other", body: "Shipment update", author: "other@example.test", participants: ["other@example.test"], timestamp: today.addingTimeInterval(28_800), url: nil, threadID: "cachinhos-thread"),
+            IndexedRecord(id: "cachinhos-yesterday", source: .messages, title: "Cachinhos old", body: "Older shipment update", author: handle, participants: [handle], timestamp: yesterday.addingTimeInterval(82_800), url: nil, threadID: "cachinhos-thread")
+        ]
+        let index = SQLiteIndex(databaseURL: databaseURL)
+        try await index.merge(source: .messages, with: records)
+
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(calendar: calendar, now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "cachinhos", displayName: "Cachinhos", aliases: [], handles: [handle])
+            ])
+        )
+        let scope = SearchScope(selectedSources: [.messages])
+        let latest = planner.plan("latest messages from Cachinhos", scope: scope, referenceDate: reference)
+        XCTAssertEqual(latest.ordering, .newestFirst)
+        XCTAssertEqual(latest.requestedResultCount, 5)
+        XCTAssertTrue(latest.needsConversationExpansion)
+        let latestRetrieved = try await index.search(plan: latest, limit: latest.requestedResultCount ?? 60)
+        XCTAssertEqual(latestRetrieved.map(\.record.id), [
+            "cachinhos-today-5", "cachinhos-today-4", "cachinhos-today-3", "cachinhos-today-2", "cachinhos-today-1", "cachinhos-today-0", "cachinhos-yesterday"
+        ])
+        XCTAssertTrue(latestRetrieved.allSatisfy { $0.record.author == handle })
+        let latestHits = Array(latestRetrieved.prefix(latest.requestedResultCount ?? latestRetrieved.count))
+        XCTAssertEqual(latestHits.map(\.record.id), [
+            "cachinhos-today-5", "cachinhos-today-4", "cachinhos-today-3", "cachinhos-today-2", "cachinhos-today-1"
+        ])
+        XCTAssertTrue(latestHits.allSatisfy { $0.record.author == handle })
+
+        let todayLatest = planner.plan("latest messages from Cachinhos today", scope: scope, referenceDate: reference)
+        XCTAssertEqual(todayLatest.constraints.startDate, today)
+        XCTAssertEqual(todayLatest.constraints.endDate, calendar.date(byAdding: .day, value: 1, to: today))
+        let todayRetrieved = try await index.search(plan: todayLatest, limit: todayLatest.requestedResultCount ?? 60)
+        XCTAssertEqual(todayRetrieved.map(\.record.id), [
+            "cachinhos-today-5", "cachinhos-today-4", "cachinhos-today-3", "cachinhos-today-2", "cachinhos-today-1", "cachinhos-today-0"
+        ])
+        XCTAssertTrue(todayRetrieved.allSatisfy { $0.record.author == handle && $0.record.timestamp >= today && $0.record.timestamp < todayLatest.constraints.endDate! })
+        let todayHits = Array(todayRetrieved.prefix(todayLatest.requestedResultCount ?? todayRetrieved.count))
+        XCTAssertEqual(todayHits.map(\.record.id), [
+            "cachinhos-today-5", "cachinhos-today-4", "cachinhos-today-3", "cachinhos-today-2", "cachinhos-today-1"
+        ])
+        XCTAssertTrue(todayHits.allSatisfy { $0.record.timestamp >= today && $0.record.timestamp < todayLatest.constraints.endDate! })
+    }
+
     func testPromptMarksRetrievedTextAsUntrustedAndBoundsEvidence() {
         let evidence = (0..<24).map { index in
             let body = "fixture-\(index) " + String(repeating: "untrusted message ", count: 500)
@@ -1275,7 +1340,7 @@ final class QueryPlanningTests: XCTestCase {
     func testNewestFirstPromptStatesOrdering() {
         let prompt = PromptBuilder.makePrompt(question: "latest 2 emails", evidence: [], ordering: .newestFirst)
         XCTAssertTrue(prompt.contains("ordered newest first"))
-        XCTAssertTrue(prompt.localizedCaseInsensitiveContains("summarize each supplied record"))
+        XCTAssertTrue(prompt.localizedCaseInsensitiveContains("use every supplied record"))
     }
 
     func testRecencyConversationFollowUpYesterdayKeepsMailOrderingAndCount() async throws {
@@ -1886,7 +1951,8 @@ final class QueryPlanningTests: XCTestCase {
         let planner = QueryPlanner(
             dateParser: DatePhraseParser(now: { reference }),
             identityResolver: IdentityResolver(identities: [
-                ContactIdentity(id: "rui", displayName: "Rui Almeida", aliases: ["Rui"], handles: ["rui@example.test"])
+                ContactIdentity(id: "rui", displayName: "Rui Almeida", aliases: ["Rui"], handles: ["rui@example.test"]),
+                ContactIdentity(id: "marta", displayName: "Marta Silva", aliases: ["Marta"], handles: ["marta@example.test"])
             ])
         )
         let prior = planner.plan("What did Rui tell me this week?", referenceDate: reference)
@@ -1908,6 +1974,41 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertFalse(plan.keywords.contains("has"))
     }
 
+    func testNaturalModelOrderingOverridesInheritedContextButNotCurrentRecency() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-08-28T12:00:00Z")!
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "rui", displayName: "Rui Almeida", aliases: ["Rui"], handles: ["rui@example.test"]),
+                ContactIdentity(id: "marta", displayName: "Marta Silva", aliases: ["Marta"], handles: ["marta@example.test"])
+            ])
+        )
+        let prior = planner.plan("latest 5 messages from Rui", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference)
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(topicPhrase: "amounts", requestedCount: 2, ordering: .upcomingFirst))
+        let inheritedOverride = await HybridQueryPlanner(planner: planner, interpreter: interpreter)
+            .plan("How much did she ask?", scope: SearchScope(selectedSources: [.messages]), context: prior, referenceDate: reference)
+        XCTAssertEqual(inheritedOverride.ordering, .upcomingFirst)
+        XCTAssertEqual(inheritedOverride.requestedResultCount, 2)
+
+        let currentRecency = await HybridQueryPlanner(planner: planner, interpreter: interpreter)
+            .plan("latest 3 messages from Rui", scope: SearchScope(selectedSources: [.messages]), context: prior, referenceDate: reference)
+        XCTAssertEqual(currentRecency.ordering, .newestFirst)
+        XCTAssertEqual(currentRecency.requestedResultCount, 3)
+
+        let knownReplacement = IntentInterpreterProbe(result: StructuredQueryIntent(personPhrase: "Marta", topicPhrase: "amounts"))
+        let knownPlan = await HybridQueryPlanner(planner: planner, interpreter: knownReplacement)
+            .plan("How much was requested by Marta today?", scope: SearchScope(selectedSources: [.messages]), context: prior, referenceDate: reference)
+        XCTAssertEqual(knownPlan.constraints.person, "Marta Silva")
+        XCTAssertFalse(knownPlan.hasUnresolvedPersonPhrase)
+
+        let unknownReplacement = IntentInterpreterProbe(result: StructuredQueryIntent(personPhrase: "Unknown Person", topicPhrase: "amounts"))
+        let unknownPlan = await HybridQueryPlanner(planner: planner, interpreter: unknownReplacement)
+            .plan("How much was requested by Unknown Person today?", scope: SearchScope(selectedSources: [.messages]), context: prior, referenceDate: reference)
+        XCTAssertNil(unknownPlan.constraints.person)
+        XCTAssertTrue(unknownPlan.hasUnresolvedPersonPhrase)
+        XCTAssertEqual(unknownPlan.retrievalPolicy, .literalKeywords)
+    }
+
     func testHybridScopeIsHardBoundaryWhenModelSuggestsDifferentSource() async {
         let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(sources: [.messages], topicPhrase: "shipment"))
         let planner = QueryPlanner()
@@ -1921,7 +2022,7 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertTrue(plan.keywords.contains("shipment"))
     }
 
-    func testHighConfidenceDeterministicPlanBypassesInterpreter() async {
+    func testLiteralLookupBypassesInterpreter() async {
         let reference = ISO8601DateFormatter().date(from: "2026-08-28T12:00:00Z")!
         let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(sources: [.mail], personPhrase: "Other Person"))
         let planner = QueryPlanner(
@@ -1931,7 +2032,7 @@ final class QueryPlanningTests: XCTestCase {
             ])
         )
         let plan = await HybridQueryPlanner(planner: planner, interpreter: interpreter)
-            .plan("Summarize Cachinhos messages of this week", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference)
+            .plan("Find messages mentioning shipment from Cachinhos", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference)
 
         let interpreterCalls = await interpreter.callCount()
         XCTAssertEqual(interpreterCalls, 0)
@@ -1955,6 +2056,112 @@ final class QueryPlanningTests: XCTestCase {
         let inventedPersonCalls = await inventedPerson.callCount()
         XCTAssertEqual(inventedPersonCalls, 1)
         XCTAssertEqual(inventedPlan, planner.plan("A free-form shipment question", referenceDate: reference))
+    }
+
+    func testNaturalAskTimeoutIsConfigurableAndFailureKeepsScopedFallback() async {
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let calendar = Calendar(identifier: .gregorian)
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(calendar: calendar, now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "marta", displayName: "Marta Silva", aliases: ["Marta"], handles: ["marta@example.test"])
+            ])
+        )
+        let interpreted = StructuredQueryIntent(topicPhrase: "amounts")
+        let delayed = DelayedIntentInterpreterProbe(delayNanoseconds: 850_000_000, result: interpreted)
+        let accepted = await HybridQueryPlanner(
+            planner: planner,
+            interpreter: delayed,
+            interpretationTimeoutNanoseconds: 1_500_000_000
+        ).plan("How much did Marta ask today?", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference)
+        XCTAssertEqual(accepted.constraints.person, "Marta Silva")
+        XCTAssertEqual(accepted.retrievalPolicy, .scopedSemanticEvidence)
+        XCTAssertTrue(accepted.keywords.contains("amounts"))
+        let delayedCalls = await delayed.callCount()
+        XCTAssertEqual(delayedCalls, 1)
+
+        let fastTimeout = DelayedIntentInterpreterProbe(delayNanoseconds: 250_000_000, result: interpreted)
+        let started = Date()
+        let timedOut = await HybridQueryPlanner(
+            planner: planner,
+            interpreter: fastTimeout,
+            interpretationTimeoutNanoseconds: 20_000_000
+        ).plan("How much did Marta ask today?", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference)
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertEqual(timedOut, planner.plan("How much did Marta ask today?", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference))
+        XCTAssertLessThan(elapsed, 0.5)
+        let fastCalls = await fastTimeout.callCount()
+        XCTAssertEqual(fastCalls, 1)
+
+        let throwing = IntentInterpreterProbe(error: true)
+        let failed = await HybridQueryPlanner(planner: planner, interpreter: throwing)
+            .plan("How much did Marta ask today?", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference)
+        XCTAssertEqual(failed, timedOut)
+    }
+
+    func testUnknownAskPersonCannotBroadenToUnrelatedTopicalEvidenceIncludingModelMerge() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("local-digest-unknown-person-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(atPath: url.path + "-shm")
+            try? FileManager.default.removeItem(atPath: url.path + "-wal")
+        }
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let calendar = Calendar(identifier: .gregorian)
+        let today = calendar.startOfDay(for: reference).addingTimeInterval(3_600)
+        let record = IndexedRecord(
+            id: "known-money", source: .messages, title: "Pagamento", body: "The money transfer is confirmed.",
+            author: "marta@example.test", participants: ["marta@example.test"], timestamp: today,
+            url: nil, threadID: nil
+        )
+        let literalRecord = IndexedRecord(
+            id: "literal-unknown", source: .messages, title: "Reference", body: "Unknown Person confirmed the money transfer.",
+            author: "marta@example.test", participants: ["marta@example.test"], timestamp: today,
+            url: nil, threadID: nil
+        )
+        let index = SQLiteIndex(databaseURL: url)
+        try await index.merge(source: .messages, with: [record, literalRecord])
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(calendar: calendar, now: { reference }),
+            identityResolver: IdentityResolver(identities: [
+                ContactIdentity(id: "marta", displayName: "Marta Silva", aliases: ["Marta"], handles: ["marta@example.test"])
+            ])
+        )
+
+        let unknownPlan = planner.plan(
+            "What did Unknown Person ask today?",
+            scope: SearchScope(selectedSources: [.messages]),
+            referenceDate: reference
+        )
+        XCTAssertTrue(unknownPlan.hasUnresolvedPersonPhrase)
+        XCTAssertEqual(unknownPlan.retrievalPolicy, .literalKeywords)
+        let unknownHits = try await index.search(plan: unknownPlan)
+        XCTAssertTrue(unknownHits.isEmpty)
+
+        // The model may identify a person phrase that the deterministic pass
+        // did not see ("by <person>"). The merged policy must become safe too.
+        let modelInterpreter = IntentInterpreterProbe(result: StructuredQueryIntent(personPhrase: "Unknown Person", topicPhrase: "money"))
+        let modelPlan = await HybridQueryPlanner(planner: planner, interpreter: modelInterpreter)
+            .plan(
+                "How much was requested by Unknown Person today?",
+                scope: SearchScope(selectedSources: [.messages]),
+                referenceDate: reference
+            )
+        XCTAssertTrue(modelPlan.hasUnresolvedPersonPhrase)
+        XCTAssertEqual(modelPlan.retrievalPolicy, .literalKeywords)
+        let modelHits = try await index.search(plan: modelPlan)
+        XCTAssertTrue(modelHits.isEmpty)
+
+        // Search is a literal surface, so an unknown name remains searchable
+        // when the indexed text itself contains it.
+        let literalSearch = planner.plan(
+            "find messages containing Unknown Person",
+            scope: SearchScope(selectedSources: [.messages]),
+            referenceDate: reference,
+            surface: .search
+        )
+        let literalHits = try await index.search(plan: literalSearch)
+        XCTAssertTrue(literalHits.contains { $0.record.id == "literal-unknown" })
     }
 
     func testStructuredIntentRejectsIdentifiersTimestampsAndQuerySyntax() {
@@ -2020,9 +2227,16 @@ final class QueryPlanningTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: url.path + "-shm")
             try? FileManager.default.removeItem(atPath: url.path + "-wal")
         }
+        let contact = IndexedRecord(
+            id: "contact-rui-empty", source: .contacts, title: "Rui Almeida", body: "Rui Almeida\nrui@example.test",
+            author: "Rui Almeida", participants: ["rui@example.test"], timestamp: .distantPast,
+            url: nil, threadID: nil
+        )
+        let index = SQLiteIndex(databaseURL: url)
+        try? await index.merge(source: .contacts, with: [contact])
         let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(sources: [.messages], personPhrase: "Rui", requestedCount: 5, ordering: .newestFirst))
         let streamer = AnswerStreamerProbe()
-        let coordinator = IndexCoordinator(index: SQLiteIndex(databaseURL: url), adapters: [])
+        let coordinator = IndexCoordinator(index: index, adapters: [])
         let store = AppStore(indexCoordinator: coordinator, intentInterpreter: interpreter, answerStreamer: streamer)
         store.question = "Anything new from Rui?"
         await store.ask()
@@ -2032,6 +2246,122 @@ final class QueryPlanningTests: XCTestCase {
         XCTAssertTrue(store.hits.isEmpty)
         XCTAssertEqual(store.answerText, "The indexed evidence did not contain a matching record.")
         XCTAssertNotNil(store.answer)
+    }
+
+    @MainActor
+    func testAskNaturalAmountQuestionUsesScopedSemanticEvidenceAndPronounFollowUps() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("local-digest-natural-amount-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(atPath: url.path + "-shm")
+            try? FileManager.default.removeItem(atPath: url.path + "-wal")
+        }
+        let calendar = Calendar.autoupdatingCurrent
+        let reference = Date()
+        let today = calendar.startOfDay(for: reference).addingTimeInterval(3_600)
+        let handle = "marta@example.test"
+        let contact = IndexedRecord(id: "contact-marta", source: .contacts, title: "Marta Silva", body: "Marta", author: "Marta Silva", participants: [handle], timestamp: .distantPast, url: nil, threadID: nil)
+        let message = IndexedRecord(
+            id: "marta-amount", source: .messages, title: "Atualização", body: "Ela pediu 4,20 € para a encomenda e depois mais 2 €. Eu enviei 7 €.",
+            author: handle, participants: [handle], timestamp: today, url: nil, threadID: "marta-thread"
+        )
+        let mixedLanguageMessage = IndexedRecord(
+            id: "marta-amount-english", source: .messages, title: "Follow-up", body: "The amounts were confirmed afterward.",
+            author: handle, participants: [handle], timestamp: today.addingTimeInterval(1_200), url: nil, threadID: "marta-thread"
+        )
+        let index = SQLiteIndex(databaseURL: url)
+        try await index.merge(source: .contacts, with: [contact])
+        try await index.merge(source: .messages, with: [message, mixedLanguageMessage])
+        let coordinator = IndexCoordinator(index: index, adapters: [])
+        let interpreter = IntentInterpreterProbe(result: StructuredQueryIntent(topicPhrase: "amounts"))
+        let streamer = EvidenceAnswerStreamerProbe()
+        let store = AppStore(indexCoordinator: coordinator, intentInterpreter: interpreter, answerStreamer: streamer)
+
+        store.question = "how much money did Marta asked me today"
+        await store.ask()
+        XCTAssertEqual(Set(store.hits.map(\.record.id)), ["marta-amount", "marta-amount-english"])
+        XCTAssertEqual(store.answerText, "Evidence received")
+        let firstInterpreterCalls = await interpreter.callCount()
+        XCTAssertEqual(firstInterpreterCalls, 1)
+
+        store.question = "How much did Unknown Person ask today?"
+        await store.ask()
+        XCTAssertTrue(store.hits.isEmpty)
+        XCTAssertEqual(store.answerText, "I couldn't match that person to an indexed contact. Try a full name or handle.")
+
+        store.question = "How much did she need?"
+        await store.ask()
+        XCTAssertEqual(Set(store.hits.map(\.record.id)), ["marta-amount", "marta-amount-english"])
+        store.question = "And how much did I actually send her?"
+        await store.ask()
+        XCTAssertEqual(Set(store.hits.map(\.record.id)), ["marta-amount", "marta-amount-english"])
+
+        let evidence = await streamer.evidenceByCall()
+        XCTAssertEqual(evidence.count, 3)
+        XCTAssertTrue(evidence.allSatisfy { Set($0.map(\.record.id)) == ["marta-amount", "marta-amount-english"] })
+        let questions = await streamer.questions()
+        XCTAssertEqual(questions, [
+            "how much money did Marta asked me today",
+            "How much did she need?",
+            "And how much did I actually send her?"
+        ])
+
+        let literal = QueryPlanner(
+            dateParser: DatePhraseParser(calendar: calendar, now: { reference }),
+            identityResolver: IdentityResolver(identities: [ContactIdentity(id: "marta", displayName: "Marta Silva", aliases: ["Marta"], handles: [handle])])
+        ).plan("find messages mentioning money", scope: SearchScope(selectedSources: [.messages]), referenceDate: reference, surface: .search)
+        XCTAssertEqual(literal.retrievalPolicy, .literalKeywords)
+        let literalHits = try await index.search(plan: literal)
+        XCTAssertTrue(literalHits.isEmpty)
+    }
+
+    func testNaturalLanguageSourceSlotsRetrieveCrossLanguageEvidenceWithinScope() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("local-digest-natural-sources-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(atPath: url.path + "-shm")
+            try? FileManager.default.removeItem(atPath: url.path + "-wal")
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let reference = ISO8601DateFormatter().date(from: "2026-09-16T12:00:00Z")!
+        let today = calendar.startOfDay(for: reference)
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: today)!
+        let handle = "rui@example.test"
+        let records = [
+            IndexedRecord(id: "mail-natural", source: .mail, title: "Atualização", body: "A encomenda segue amanhã.", author: handle, participants: [handle], timestamp: today.addingTimeInterval(3_600), url: nil, threadID: nil),
+            IndexedRecord(id: "calendar-natural", source: .calendar, title: "Consulta", body: "Reunião de logística", author: "Calendário", participants: [], timestamp: tomorrow.addingTimeInterval(3_600), url: nil, threadID: nil),
+            IndexedRecord(id: "reminder-natural", source: .reminders, title: "Ligar", body: "Confirmar transporte", author: "Lembretes", participants: [], timestamp: tomorrow.addingTimeInterval(7_200), url: nil, threadID: nil),
+            IndexedRecord(id: "note-natural", source: .notes, title: "Anotação", body: "Detalhes do embarque", author: nil, participants: [], timestamp: today.addingTimeInterval(10_800), url: nil, threadID: nil),
+            IndexedRecord(id: "contact-natural", source: .contacts, title: "Rui Almeida", body: "Rui\n\(handle)", author: "Rui Almeida", participants: [handle], timestamp: .distantPast, url: nil, threadID: nil)
+        ]
+        let index = SQLiteIndex(databaseURL: url)
+        for source in SourceKind.allCases {
+            let sourceRecords = records.filter { $0.source == source }
+            if !sourceRecords.isEmpty { try await index.merge(source: source, with: sourceRecords) }
+        }
+        let planner = QueryPlanner(
+            dateParser: DatePhraseParser(calendar: calendar, now: { reference }),
+            identityResolver: IdentityResolver(identities: [ContactIdentity(id: "rui", displayName: "Rui Almeida", aliases: ["Rui"], handles: [handle])])
+        )
+        let cases: [(String, SourceKind, StructuredQueryIntent, String)] = [
+            ("What arrived in my emails today?", .mail, StructuredQueryIntent(sources: [.mail], timeframePhrase: "today"), "mail-natural"),
+            ("Do I have anything scheduled tomorrow?", .calendar, StructuredQueryIntent(sources: [.calendar], timeframePhrase: "tomorrow"), "calendar-natural"),
+            ("List everything I need to do tomorrow", .reminders, StructuredQueryIntent(sources: [.reminders], timeframePhrase: "tomorrow"), "reminder-natural"),
+            ("What did I write today?", .notes, StructuredQueryIntent(sources: [.notes], timeframePhrase: "today"), "note-natural"),
+            ("How can I reach Rui?", .contacts, StructuredQueryIntent(sources: [.contacts], personPhrase: "Rui"), "contact-natural")
+        ]
+        for (question, source, result, expectedID) in cases {
+            let interpreter = IntentInterpreterProbe(result: result)
+            let plan = await HybridQueryPlanner(planner: planner, interpreter: interpreter)
+                .plan(question, scope: SearchScope(), referenceDate: reference)
+            let interpreterCalls = await interpreter.callCount()
+            XCTAssertEqual(interpreterCalls, 1, question)
+            XCTAssertEqual(plan.constraints.sources, [source], question)
+            XCTAssertEqual(plan.retrievalPolicy, .scopedSemanticEvidence, question)
+            let hits = try await index.search(plan: plan, limit: 10)
+            XCTAssertEqual(hits.map(\.record.id), [expectedID], question)
+        }
     }
 }
 
@@ -2055,6 +2385,25 @@ private actor IntentInterpreterProbe: QueryIntentInterpreting {
     func callCount() -> Int { capturedQuestions.count }
 }
 
+private actor DelayedIntentInterpreterProbe: QueryIntentInterpreting {
+    let delayNanoseconds: UInt64
+    let result: StructuredQueryIntent
+    private var capturedCallCount = 0
+
+    init(delayNanoseconds: UInt64, result: StructuredQueryIntent) {
+        self.delayNanoseconds = delayNanoseconds
+        self.result = result
+    }
+
+    func interpret(question: String, provider: AIProvider, referenceDate: Date) async throws -> StructuredQueryIntent {
+        capturedCallCount += 1
+        try await Task.sleep(nanoseconds: delayNanoseconds)
+        return result
+    }
+
+    func callCount() -> Int { capturedCallCount }
+}
+
 private actor AnswerStreamerProbe: AnswerStreaming {
     private var calls = 0
 
@@ -2076,6 +2425,32 @@ private actor AnswerStreamerProbe: AnswerStreaming {
     }
 
     func callCount() -> Int { calls }
+}
+
+private actor EvidenceAnswerStreamerProbe: AnswerStreaming {
+    private var capturedQuestions: [String] = []
+    private var capturedEvidence: [[SearchHit]] = []
+
+    func stream(
+        question: String,
+        evidence: [SearchHit],
+        provider: AIProvider,
+        intent: QueryIntent,
+        referenceDate: Date,
+        previousAnswer: String?,
+        requireNewDetails: Bool,
+        evidenceOrdering: QueryOrdering
+    ) async -> AsyncThrowingStream<String, Error> {
+        capturedQuestions.append(question)
+        capturedEvidence.append(evidence)
+        return AsyncThrowingStream { continuation in
+            continuation.yield("Evidence received")
+            continuation.finish()
+        }
+    }
+
+    func questions() -> [String] { capturedQuestions }
+    func evidenceByCall() -> [[SearchHit]] { capturedEvidence }
 }
 
 private func messagePlan(keywords: [String]) -> QueryPlan {

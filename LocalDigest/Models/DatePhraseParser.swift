@@ -4,13 +4,22 @@ struct DatePhraseParser: Sendable {
     private let calendar: Calendar
     private let now: @Sendable () -> Date
 
+    /// A bounded list of observed relative-date typos. Corrections are
+    /// applied only to complete temporal tokens, never to arbitrary search
+    /// language or concrete dates.
+    private static let temporalTypoAllowlist: [String: String] = [
+        "toyda": "today"
+    ]
+
+    static let temporalTypoTokens: Set<String> = Set(temporalTypoAllowlist.keys)
+
     init(calendar: Calendar = .autoupdatingCurrent, now: @escaping @Sendable () -> Date = Date.init) {
         self.calendar = calendar
         self.now = now
     }
 
     func parse(_ text: String, referenceDate: Date? = nil) -> DateParseResult? {
-        let normalized = text.lowercased()
+        let normalized = Self.normalizeTemporalTypos(in: text.lowercased())
         let reference = referenceDate ?? now()
         if let explicit = parseExplicitDate(normalized, reference: reference) {
             return explicit
@@ -62,6 +71,13 @@ struct DatePhraseParser: Sendable {
             return weekday
         }
         return nil
+    }
+
+    private static func normalizeTemporalTypos(in text: String) -> String {
+        temporalTypoAllowlist.reduce(text) { text, entry in
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: entry.key) + "\\b"
+            return text.replacingOccurrences(of: pattern, with: entry.value, options: .regularExpression)
+        }
     }
 
     private func parseWeekday(_ text: String, reference: Date) -> DateParseResult? {

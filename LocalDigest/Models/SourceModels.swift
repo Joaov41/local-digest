@@ -161,6 +161,19 @@ enum QueryOrdering: Equatable, Sendable {
     case upcomingFirst
 }
 
+enum QuerySurface: Equatable, Sendable {
+    case ask
+    case search
+}
+
+enum QueryRetrievalPolicy: Equatable, Sendable {
+    /// Every keyword is a literal FTS search term.
+    case literalKeywords
+    /// Keywords describe a natural-language request but do not gate evidence
+    /// inside the plan's validated person/date/source boundaries.
+    case scopedSemanticEvidence
+}
+
 struct QueryPlan: Equatable, Sendable {
     let originalQuestion: String
     let keywords: [String]
@@ -173,6 +186,12 @@ struct QueryPlan: Equatable, Sendable {
     let continuesConversation: Bool
     let ordering: QueryOrdering
     let requestedResultCount: Int?
+    let retrievalPolicy: QueryRetrievalPolicy
+    let surface: QuerySurface
+    /// True when the user supplied a person-shaped phrase that did not resolve
+    /// to a unique local identity. Ask must not use the remaining topic words
+    /// to broaden that request into unrelated records.
+    let hasUnresolvedPersonPhrase: Bool
 
     init(
         originalQuestion: String,
@@ -185,7 +204,10 @@ struct QueryPlan: Equatable, Sendable {
         lookupScope: LookupScope = .topic,
         continuesConversation: Bool = false,
         ordering: QueryOrdering = .relevance,
-        requestedResultCount: Int? = nil
+        requestedResultCount: Int? = nil,
+        retrievalPolicy: QueryRetrievalPolicy = .literalKeywords,
+        hasUnresolvedPersonPhrase: Bool = false,
+        surface: QuerySurface = .ask
     ) {
         self.originalQuestion = originalQuestion
         self.keywords = keywords
@@ -198,6 +220,9 @@ struct QueryPlan: Equatable, Sendable {
         self.continuesConversation = continuesConversation
         self.ordering = ordering
         self.requestedResultCount = requestedResultCount.map { min(50, max(1, $0)) }
+        self.retrievalPolicy = retrievalPolicy
+        self.hasUnresolvedPersonPhrase = hasUnresolvedPersonPhrase
+        self.surface = surface
     }
 
     var isConstrainedByDate: Bool { constraints.startDate != nil || constraints.endDate != nil }

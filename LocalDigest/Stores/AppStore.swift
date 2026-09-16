@@ -246,7 +246,7 @@ final class AppStore: ObservableObject {
         await ensurePlannerReady()
         errorMessage = nil
         do {
-            let plan = await HybridQueryPlanner(deterministic: planner, interpreter: intentInterpreter)
+            let plan = await HybridQueryPlanner(deterministic: planner, interpreter: intentInterpreter, surface: .search)
                 .plan(query, provider: provider)
             guard plan.ambiguity.isEmpty else {
                 errorMessage = "More than one contact matches: \(plan.ambiguity.joined(separator: ", ")). Add a surname or choose the person first."
@@ -293,10 +293,23 @@ final class AppStore: ObservableObject {
         let requestProvider = provider
         let requestDate = Date()
         do {
-            let plan = await HybridQueryPlanner(deterministic: planner, interpreter: intentInterpreter)
+            let plan = await HybridQueryPlanner(deterministic: planner, interpreter: intentInterpreter, surface: .ask)
                 .plan(query, context: conversationPlan, referenceDate: requestDate, provider: requestProvider)
             guard plan.ambiguity.isEmpty else {
                 throw QueryPlanningError.ambiguousContacts(plan.ambiguity)
+            }
+            if plan.surface == .ask, plan.hasUnresolvedPersonPhrase {
+                // Do not let an unresolved person turn into a date/topic-only
+                // search, and do not merge prior contact evidence into this
+                // turn. Keep the prior conversation plan available for a
+                // corrected follow-up.
+                hits = []
+                answerText = "I couldn't match that person to an indexed contact. Try a full name or handle."
+                answer = Answer(text: answerText, citations: [], provider: requestProvider)
+                conversationTurns.append(ConversationTurn(question: query, answer: answerText, citations: [], provider: requestProvider))
+                lastSubmittedQuestion = query
+                question = ""
+                return
             }
             let retrievalLimit = deeperRequest ? 120 : (plan.requestedResultCount ?? 60)
             let retrieved = try await indexCoordinator.search(plan: plan, limit: retrievalLimit)
@@ -495,7 +508,10 @@ final class AppStore: ObservableObject {
                 }
             } else {
                 let requestDate = Date()
-                let plan = planner.plan(query, context: conversationPlan, referenceDate: requestDate)
+                // Reply-target selection is an explicit lookup flow. Keep it
+                // lexical and deterministic; the Ask semantic-evidence
+                // policy must not broaden who a draft could target.
+                let plan = planner.plan(query, context: conversationPlan, referenceDate: requestDate, surface: .search)
                 guard plan.ambiguity.isEmpty else {
                     throw QueryPlanningError.ambiguousContacts(plan.ambiguity)
                 }
