@@ -46,6 +46,18 @@ struct DatePhraseParser: Sendable {
             let end = calendar.date(byAdding: .day, value: 1, to: tomorrow) ?? tomorrow
             return DateParseResult(start: tomorrow, end: end, phrase: "tomorrow")
         }
+        if normalized.contains("tonight") {
+            let start = calendar.date(bySettingHour: 18, minute: 0, second: 0, of: reference) ?? reference
+            let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: reference)) ?? reference
+            let end = calendar.date(bySettingHour: 6, minute: 0, second: 0, of: tomorrow) ?? tomorrow
+            return DateParseResult(start: start, end: end, phrase: "tonight")
+        }
+        if normalized.contains("last weekend") {
+            return weekendInterval(reference: reference, offset: -1, phrase: "last weekend")
+        }
+        if normalized.contains("this weekend") || normalized == "weekend" || normalized.contains(" weekend") {
+            return weekendInterval(reference: reference, offset: 0, phrase: "weekend")
+        }
         if normalized.contains("this morning") {
             let start = calendar.date(bySettingHour: 5, minute: 0, second: 0, of: reference) ?? reference
             let end = calendar.date(bySettingHour: 12, minute: 0, second: 0, of: reference) ?? reference
@@ -71,6 +83,21 @@ struct DatePhraseParser: Sendable {
             return weekday
         }
         return nil
+    }
+
+    private func weekendInterval(reference: Date, offset: Int, phrase: String) -> DateParseResult {
+        let day = calendar.startOfDay(for: reference)
+        let weekday = calendar.component(.weekday, from: day)
+        let daysUntilSaturday: Int
+        if weekday == 7 || weekday == 1 {
+            daysUntilSaturday = weekday == 7 ? 0 : -1
+        } else {
+            daysUntilSaturday = 7 - weekday
+        }
+        let currentWeekend = calendar.date(byAdding: .day, value: daysUntilSaturday, to: day) ?? day
+        let start = calendar.date(byAdding: .day, value: offset * 7, to: currentWeekend) ?? currentWeekend
+        let end = calendar.date(byAdding: .day, value: 2, to: start) ?? start
+        return DateParseResult(start: start, end: end, phrase: phrase)
     }
 
     private static func normalizeTemporalTypos(in text: String) -> String {

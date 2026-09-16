@@ -28,6 +28,24 @@ protocol AnswerStreaming: Sendable {
 struct QueryPlanner: Sendable {
     fileprivate let dateParser: DatePhraseParser
     private let identityResolver: IdentityResolver
+    private static let queryStopWords: Set<String> = [
+        "what", "did", "tell", "told", "say", "said", "me", "night", "summarize", "our",
+        "conversation", "the", "about", "with", "and", "from", "my", "contact", "please", "this",
+        "morning", "today", "yesterday", "tomorrow", "week", "message", "messages", "chat", "on", "at",
+        "in", "during", "find", "found", "locate", "show", "list", "a", "an", "for", "it", "is", "are",
+        "was", "were", "do", "does", "can", "you", "of", "to", "be", "there", "any", "where", "which",
+        "mention", "mentions", "contains", "containing", "titled", "called", "named",
+        "he", "she", "they", "him", "her", "them", "his", "hers", "their", "theirs", "that", "those",
+        "go", "dig", "going", "deeper", "more", "elaborate", "expand", "continue", "else",
+        "detail", "details", "context", "info", "catch", "catchup", "caught", "up", "anything",
+        "new", "sent", "recently", "few",
+        "when", "who", "whom", "whose", "how", "why", "get", "got", "gets", "need", "needs", "have",
+        "has", "had", "remind", "happened", "happen", "happens", "miss", "missed", "talk", "talked",
+        "talking", "meet", "met", "write", "wrote", "written", "everything", "all", "some", "something",
+        "give", "gave", "know", "want", "wants", "should", "would", "could", "will", "just", "also",
+        "like", "let", "lets", "see", "check", "look", "due", "its", "i", "im", "ive", "we", "us",
+        "they", "or", "but", "if", "so", "than", "then", "because", "again", "really"
+    ]
 
     init(dateParser: DatePhraseParser = DatePhraseParser(), identityResolver: IdentityResolver = IdentityResolver()) {
         self.dateParser = dateParser
@@ -37,12 +55,6 @@ struct QueryPlanner: Sendable {
     func plan(_ question: String, scope: SearchScope = SearchScope(), context: QueryPlan? = nil, referenceDate: Date? = nil, surface: QuerySurface = .ask) -> QueryPlan {
         let date = dateParser.parse(question, referenceDate: referenceDate)
         let sourceIntent = explicitSource(in: question)
-        let explicitPersonPhrase: String?
-        if sourceIntent == nil || sourceIntent?.source == .mail || sourceIntent?.source == .messages {
-            explicitPersonPhrase = extractPersonPhrase(from: question, sourceIntent: sourceIntent).flatMap(Self.withoutPronouns)
-        } else {
-            explicitPersonPhrase = nil
-        }
         // Elliptical continuations intentionally change only the person
         // boundary while retaining the prior topic, for example "And
         // Cachinhos?" after a shipment question. Complete replacement
@@ -50,6 +62,9 @@ struct QueryPlanner: Sendable {
         // when the contact changes.
         let continuationPersonPhrase = context != nil
             ? extractContinuationPersonPhrase(from: question)
+            : nil
+        let explicitPersonPhrase = continuationPersonPhrase == nil
+            ? extractPersonPhrase(from: question, sourceIntent: sourceIntent).flatMap(Self.withoutPronouns)
             : nil
         let personPhrase = explicitPersonPhrase ?? continuationPersonPhrase
         let isContinuationPersonChange = explicitPersonPhrase == nil && continuationPersonPhrase != nil
@@ -59,23 +74,11 @@ struct QueryPlanner: Sendable {
         // language instead of silently turning it into a person filter.
         let identity = resolved.count == 1 ? resolved.first : nil
         let recency = recencyRequest(in: question, sourceIntent: sourceIntent)
-        let stopWords: Set<String> = [
-            "what", "did", "tell", "told", "say", "said", "me", "night", "summarize", "our",
-            "conversation", "the", "about", "with", "and", "from", "my", "contact", "please", "this",
-            "morning", "today", "yesterday", "tomorrow", "week", "message", "messages", "chat", "on", "at",
-            "in", "during", "find", "found", "locate", "show", "list", "a", "an", "for", "it", "is", "are",
-            "was", "were", "do", "does", "can", "you", "of", "to", "be", "there", "any", "where", "which",
-            "mention", "mentions", "contains", "containing", "titled", "called", "named",
-            "he", "she", "they", "him", "her", "them", "his", "hers", "their", "theirs", "that", "those",
-            "go", "dig", "going", "deeper", "more", "elaborate", "expand", "continue", "else",
-            "detail", "details", "context", "info", "catch", "catchup", "caught", "up", "anything",
-            "new", "sent", "recently", "few"
-        ]
         var dateTokens: Set<String> = [
             "january", "jan", "february", "feb", "march", "mar", "april", "apr", "may", "june", "jun",
             "july", "jul", "august", "aug", "september", "sep", "october", "oct", "november", "nov",
             "december", "dec", "monday", "mon", "tuesday", "tue", "wednesday", "wed", "thursday", "thu",
-            "friday", "fri", "saturday", "sat", "sunday", "sun", "next", "previous"
+            "friday", "fri", "saturday", "sat", "sunday", "sun", "next", "previous", "weekend", "tonight"
         ]
         dateTokens.formUnion(DatePhraseParser.temporalTypoTokens)
         let resolvedPersonTokens = Set(
@@ -88,7 +91,7 @@ struct QueryPlanner: Sendable {
             resolvedPersonTokens: resolvedPersonTokens
         )
         let currentKeywords = questionTokens.enumerated().filter { index, token in
-            !stopWords.contains(token)
+            !Self.queryStopWords.contains(token)
                 && !dateTokens.contains(token)
                 && !recency.excludedTokenIndices.contains(index)
                 && !(date != nil && ["last", "night", "week"].contains(token))
@@ -543,13 +546,14 @@ struct QueryPlanner: Sendable {
     private func structuralRecencyOperatorIndices(in tokens: [String], sourceIndex: Int, source: SourceKind?, count: Int?) -> Set<Int> {
         guard sourceIndex > 0 else { return [] }
         let futureSource = source.map { $0 == .calendar || $0 == .reminders } ?? (tokens.contains("calendar") || tokens.contains("event") || tokens.contains("events") || tokens.contains("reminder") || tokens.contains("reminders"))
-        let recognized: Set<String> = ["latest", "latests", "lastest", "newest", "recent", "most", "last", "upcoming", "next"]
+        let recognized: Set<String> = ["latest", "latests", "lastest", "newest", "recent", "most", "last", "upcoming", "next", "the"]
         let qualifierTokens: Set<String> = ["received", "incoming", "unread", "new"]
+        let pluralSourceTokens: Set<String> = ["emails", "messages", "texts", "imessages", "chats", "notes", "events", "reminders"]
         var result = Set<Int>()
         for index in 0..<sourceIndex {
             guard let canonical = canonicalRecencyToken(tokens[index]) else { continue }
             if ["upcoming", "next"].contains(canonical), !futureSource { continue }
-            if canonical == "last", count == nil { continue }
+            if canonical == "last", count == nil, pluralSourceTokens.contains(tokens[sourceIndex]) { continue }
             let between = tokens[(index + 1)..<sourceIndex]
             guard between.allSatisfy({
                 Int($0) != nil || recognized.contains($0) || qualifierTokens.contains($0)
@@ -680,8 +684,26 @@ struct QueryPlanner: Sendable {
         if hasAny(["contact"]) {
             return SourceIntentMatch(source: .contacts, excludedTokens: ["contact"])
         }
+        if hasSequence(["who", "is"]) || hasSequence(["who", "s"]) || hasAny(["phone", "address"]) {
+            return SourceIntentMatch(source: .contacts, excludedTokens: ["who", "is", "s", "phone", "address"])
+        }
         if hasAny(["calendar", "calendars", "event", "events", "meeting", "meetings", "appointment", "appointments", "schedule", "scheduled", "agenda"]) {
             return SourceIntentMatch(source: .calendar, excludedTokens: ["calendar", "calendars", "event", "events", "meeting", "meetings", "appointment", "appointments", "schedule", "scheduled", "agenda"])
+        }
+        if hasAny(["meet", "meets", "met"]) {
+            return SourceIntentMatch(source: .calendar, excludedTokens: ["meet", "meets", "met"])
+        }
+        if hasAny(["remind", "reminded", "due", "overdue", "chores"])
+            || hasSequence(["need", "to", "do"])
+            || hasSequence(["have", "to", "do"])
+            || hasSequence(["to", "do"]) {
+            return SourceIntentMatch(
+                source: .reminders,
+                excludedTokens: ["remind", "reminded", "due", "overdue", "chores", "need", "needs", "have", "to", "do"]
+            )
+        }
+        if hasAny(["wrote", "write", "written", "jotted", "noted"]) {
+            return SourceIntentMatch(source: .notes, excludedTokens: ["wrote", "write", "written", "jotted", "noted"])
         }
         if let typo = fuzzyCommunicationSource(in: tokens) {
             return SourceIntentMatch(
@@ -753,7 +775,52 @@ struct QueryPlanner: Sendable {
         if let marked = extractMarkedPersonPhrase(from: question) {
             return marked
         }
-        return extractKnownPersonBeforeSource(from: question, sourceIntent: sourceIntent)
+        if let beforeSource = extractKnownPersonBeforeSource(from: question, sourceIntent: sourceIntent) {
+            return beforeSource
+        }
+        let possessiveStripped = question.replacingOccurrences(
+            of: #"['’]s\b"#,
+            with: "",
+            options: [.caseInsensitive, .regularExpression]
+        )
+        let tokens = IdentityResolver.tokens(possessiveStripped)
+        guard !tokens.isEmpty else { return nil }
+        let hasLeadingPossessive = question.range(
+            of: #"^\s*\S+['’]s\b"#,
+            options: [.caseInsensitive, .regularExpression]
+        ) != nil
+        let sourceTokens = Set(SourceKind.allCases.flatMap { sourceWords(for: $0) })
+        let recencyTokens: Set<String> = [
+            "latest", "latests", "lastest", "newest", "recent", "most", "last", "upcoming", "next",
+            "received", "incoming", "unread", "new"
+        ]
+        for length in stride(from: min(2, tokens.count), through: 1, by: -1) {
+            guard length <= tokens.count else { continue }
+            for start in 0...(tokens.count - length) {
+                if start > 0, tokens[start - 1] == "about" { continue }
+                let candidate = tokens[start..<(start + length)].joined(separator: " ")
+                if length == 1 {
+                    guard candidate.count >= 3,
+                          !(start == 0 && tokens.count > 1 && !hasLeadingPossessive),
+                          Int(candidate) == nil,
+                          !candidate.contains("@"),
+                          !Self.isPhoneLike(candidate),
+                          !Self.queryStopWords.contains(candidate),
+                          !sourceTokens.contains(candidate),
+                          !recencyTokens.contains(candidate) else { continue }
+                }
+                guard !identityResolver.resolve(candidate).isEmpty else { continue }
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private static func isPhoneLike(_ value: String) -> Bool {
+        guard !value.contains("@") else { return false }
+        let digits = value.filter(\.isNumber)
+        guard digits.count >= 7 else { return false }
+        return value.allSatisfy { $0.isNumber || " +()-./".contains($0) }
     }
 
     /// Extracts a known contact from a deliberately elliptical continuation.
